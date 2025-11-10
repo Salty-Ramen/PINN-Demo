@@ -47,3 +47,7 @@ Results/*
 auto-save-list
 tramp
 .\#*
+
+# R
+
+*.Rhistory
