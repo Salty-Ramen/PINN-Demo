@@ -67,7 +67,7 @@ function loss_IC(ps, ctx)
     smodel = state_model(ps, ctx)
     tspan = ctx.t_span
     init_obs = ctx.y0_obs
-    IC_MSE = MSE(smodel([tspan[1]]'), init_obs, std(init_obs))
+    IC_MSE = MSE(smodel([tspan[1]]'), init_obs, std(init_obs, dims = 2))
     return IC_MSE
 end
 
