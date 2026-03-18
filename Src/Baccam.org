@@ -1,0 +1,925 @@
+#+TITLE: Baccam Model — Grey-box Recovery with Sampling Design Exploration
+#+AUTHOR: Ramakrishna Suresh
+#+PROPERTY: header-args:julia-vterm :session *julia* :results output :exports both :dir (projectile-project-root) :tangle yes :comments both
+#+STARTUP: inlineimages overview
+
+* Setup
+** Background
+
+This notebook applies the AI-Aristotle-style grey-box identification framework
+to the target cell-limited model of influenza A virus infection from Baccam et
+al. (2006), /J. Virol./ 80(15):7590–7599.
+
+The model tracks three populations — target epithelial cells (T), productively
+infected cells (I), and free virus (V) — and was originally fit to nasal wash
+viral titers from volunteers experimentally infected with H1N1 influenza
+A/Hong Kong/123/77.
+
+*** The full (true) model
+
+#+NAME: eq:Baccam-true
+\begin{subequations}
+\begin{align}
+&\frac{dT}{dt} = -\beta \, T \, V \\[4pt]
+&\frac{dI}{dt} = \beta \, T \, V - \delta \, I \\[4pt]
+&\frac{dV}{dt} = p \, I - c \, V
+\end{align}
+\end{subequations}
+
+*** Published parameter values (geometric means from Baccam et al. Table 2)
+
+#+NAME: table:Baccam-params
+| Parameter | Description                     |           Value | Units                      |
+|-----------+---------------------------------+-----------------+----------------------------|
+| $T_0$     | Initial target cells            |      $4\times10^{8}$ | cells                      |
+| $V_0$     | Initial viral inoculum          | $9.3\times10^{-2}$ | TCID_{50}/ml                   |
+| $\beta$       | Infection rate constant          | $2.7\times10^{-5}$ | (TCID_{50}/ml)^{-1} · d^{-1}        |
+| $p$       | Virus production rate per cell  | $1.2\times10^{-2}$ | TCID_{50}/ml · d^{-1} · cell^{-1} |
+| $c$       | Viral clearance rate            |             3.0 | d^{-1}                       |
+| $\delta$      | Infected cell death rate        |             4.0 | d^{-1}                       |
+
+*** Grey-box formulation
+
+We assume that the source and sink of /target cells/ (dT/dt) and the /virus
+production/ term in dV/dt are unknown. The known physics is restricted to the
+infected-cell equation. Two neural-network-approximated functions $g_T$ and
+$g_V$ replace the missing terms:
+
+#+NAME: eq:Baccam-greybox
+\begin{subequations}
+\begin{align}
+&\frac{dT}{dt} = \mathrm{g}_T(t,\,\theta_g) \\[4pt]
+&\frac{dI}{dt} = \beta \, T \, V - \delta \, I \\[4pt]
+&\frac{dV}{dt} = \mathrm{g}_V(t,\,\theta_g) - c \, V
+\end{align}
+\end{subequations}
+
+After training, symbolic regression is applied to $g_T$ and $g_V$ to recover
+the analytical forms $g_T = -\beta\,T\,V$ and $g_V = p\,I$.
+
+*** Experimental design: lean vs wide sampling
+
+In animal studies the total number of sacrificed animals is typically fixed by
+ethical and budgetary constraints. We simulate this by holding the total
+observation budget $N_{\text{total}} = n_{\text{timepoints}} \times
+n_{\text{mice}}$ constant at 120 and exploring three configurations:
+
+| Configuration | Timepoints | Mice / timepoint | Character        |
+|---------------+------------+-------------------+------------------|
+| A (lean)      |          5 |                24 | Few times, dense replicates |
+| B (balanced)  |         10 |                12 | Moderate both    |
+| C (wide)      |         20 |                 6 | Many times, lean replicates |
+
+Each "mouse" is an independent noisy realisation of the ODE solution at that
+timepoint. Noise is log-normal (multiplicative) to reflect biological
+variability, and the per-timepoint mean across mice becomes the training signal.
+
+*** Normalisation strategy
+
+All three states span a range of ~0 to 10⁸. We apply log₁₀ (with a small floor
+to avoid log(0)) followed by min-max scaling to [0, 1]. This compresses the
+dynamic range into a regime where the MLP activations and loss gradients are
+well behaved, without introducing the distributional assumptions of z-scoring.
+
+** Boilerplate
+
+#+begin_src julia-vterm :results nil
+using Pkg;
+Pkg.activate(".")
+#+end_src
+
+#+begin_src julia-vterm :results nil
+using ComponentArrays
+using Lux, NNlib
+using Optimization, OptimizationOptimisers, OptimizationOptimJL
+using Enzyme
+using ForwardDiff
+using Statistics
+using Random
+using Base.Threads
+using DifferentialEquations
+using CairoMakie, Makie
+using CSV, DataFrames
+using Random, Statistics
+using Printf
+
+include(
+    joinpath(pwd(), "Src", "Fitting.jl")
+)
+#+end_src
+
+** Defining the Baccam model and parameter struct
+
+The struct wraps the three ODE rate constants that appear in the known part of
+the grey-box architecture — β (infection rate), δ (infected-cell death rate),
+and c (viral clearance rate). Virus production rate /p/ is deliberately excluded
+because it lives inside the unknown term $g_V$.
+
+#+begin_src julia-vterm
+struct BaccamParams{T<:AbstractFloat}
+    β::T   # infection rate constant
+    δ::T   # infected cell death rate
+    c::T   # viral clearance rate
+end
+
+# Convenience constructor from a ComponentVector (used by the optimizer)
+BaccamParams(nt::ComponentVector) = BaccamParams(nt.β, nt.δ, nt.c)
+#+end_src
+
+#+RESULTS:
+
+** Generating the ground-truth dataset
+
+We solve the full Baccam ODE with the published geometric-mean parameter
+estimates from Table 2 of Baccam et al. (2006). The solution is evaluated on a
+fine grid and then sub-sampled according to the three experimental
+configurations defined above.
+
+#+begin_src julia-vterm
+
+# Full ODE right-hand side for DifferentialEquations.jl
+function Baccam_model!(du, u, p, t)
+    T, I, V = u
+    du[1] = -p.β * T * V
+    du[2] =  p.β * T * V - p.δ * I
+    du[3] =  p.p * I     - p.c * V
+end
+
+# True parameters — geometric means from Baccam et al. (2006) Table 2
+# All four params are packed here for data generation; the grey-box will only
+# expose β, δ, c to the optimizer.
+true_params = (β = 2.7f-5, δ = 4.0f0, p = 1.2f-2, c = 3.0f0)
+
+# Initial conditions (T₀ from paper, I₀ = 0, V₀ geometric mean from Table 2)
+u0 = Float32[4.0f8, 0.0f0, 9.3f-2]
+
+# Timespan matches the 8-day observation window in the original study
+t_span = (0.0f0, 8.0f0)
+
+# Solve on a fine grid for later sub-sampling
+N_fine = 2001
+t_fine = range(t_span[1], t_span[2], length = N_fine) |> collect
+
+prob = ODEProblem(
+    Baccam_model!,
+    u0,
+    t_span,
+    (β = true_params.β, δ = true_params.δ, p = true_params.p, c = true_params.c)
+)
+
+sol = solve(prob, Tsit5(); saveat = t_fine)
+sol_array = Array(sol)  # 3 × N_fine
+#+end_src
+
+#+RESULTS:
+
+** Creating the three sampling configurations
+
+For each configuration we: (1) select the timepoint locations, (2) draw
+~n_mice~ independent log-normal noise realisations per timepoint, and (3)
+compute the per-timepoint mean across mice as the training signal. All three
+datasets are saved as CSV files for reproducibility.
+
+#+begin_src julia-vterm
+
+# Reproducible RNG
+rng = MersenneTwister(42)
+
+# Log-normal multiplicative noise: X_obs = X_true * exp(σε − σ²/2),  ε ~ N(0,1)
+noise_σ = 0.5f0
+
+"""
+    generate_config(rng, sol_array, t_fine, n_tp, n_mice, noise_σ)
+
+Sub-sample the ODE solution at `n_tp` equally-spaced timepoints and generate
+`n_mice` noisy replicates per timepoint. Returns a NamedTuple with raw data
+and the mouse-averaged training matrix.
+"""
+function generate_config(rng, sol_array, t_fine, n_tp, n_mice, noise_σ)
+    # Indices into the fine time grid (equally spaced, including endpoints)
+    idx = round.(Int, range(1, length(t_fine), length = n_tp))
+    t_obs = Float32.(t_fine[idx])               # n_tp
+    Y_true = Float32.(sol_array[:, idx])         # 3 × n_tp
+
+    # Draw n_mice independent noise realisations per timepoint
+    ε = randn(rng, Float32, 3, n_tp, n_mice)
+    Y_noisy = Y_true .* exp.(noise_σ .* ε .- 0.5f0 * noise_σ^2)
+    Y_noisy = clamp.(Y_noisy, 0.0f0, Inf32)
+
+    # Training signal: per-timepoint mean across mice
+    Y_mean = dropdims(mean(Y_noisy; dims = 3); dims = 3)   # 3 × n_tp
+
+    return (
+        t_obs    = t_obs,
+        Y_true   = Y_true,
+        Y_noisy  = Y_noisy,   # 3 × n_tp × n_mice — kept for plotting
+        Y_mean   = Y_mean,    # 3 × n_tp — this is the training target
+        n_tp     = n_tp,
+        n_mice   = n_mice,
+    )
+end
+
+# Three configurations: total budget = 120
+config_A = generate_config(rng, sol_array, t_fine, 5,  24, noise_σ)
+config_B = generate_config(rng, sol_array, t_fine, 10, 12, noise_σ)
+config_C = generate_config(rng, sol_array, t_fine, 20,  6, noise_σ)
+
+configs = Dict("A_5x24" => config_A, "B_10x12" => config_B, "C_20x6" => config_C)
+#+end_src
+
+#+RESULTS:
+
+** Saving the datasets
+
+#+begin_src julia-vterm
+
+for (label, cfg) in configs
+    df = DataFrame(
+        t      = cfg.t_obs,
+        T_true = cfg.Y_true[1, :],
+        I_true = cfg.Y_true[2, :],
+        V_true = cfg.Y_true[3, :],
+        T_mean = cfg.Y_mean[1, :],
+        I_mean = cfg.Y_mean[2, :],
+        V_mean = cfg.Y_mean[3, :],
+    )
+    CSV.write(
+        joinpath(pwd(), "Results", "Baccam_$(label).csv"),
+        df
+    )
+    println("Saved Baccam_$(label).csv  ($(cfg.n_tp) timepoints × $(cfg.n_mice) mice)")
+end
+#+end_src
+
+#+RESULTS:
+: Saved Baccam_C_20x6.csv  (20 timepoints × 6 mice)
+: Saved Baccam_B_10x12.csv  (10 timepoints × 12 mice)
+: Saved Baccam_A_5x24.csv  (5 timepoints × 24 mice)
+
+** Visualising the three sampling configurations
+
+Each panel column corresponds to a configuration (A, B, C). Rows are the three
+states T, I, V. Individual mice are shown as translucent points; the
+mouse-averaged training signal is shown as filled circles; the true ODE solution
+is the solid line.
+
+The y-axis uses ~pseudolog10~ so that the zero-valued initial condition for I
+and V's small early values are visible without clipping.
+
+#+begin_src julia-vterm
+
+fig = Figure(size = (1200, 700), fontsize = 12)
+
+state_labels = ["Target cells  T(t)", "Infected cells  I(t)", "Free virus  V(t)"]
+config_labels = ["A: 5 tp × 24 mice", "B: 10 tp × 12 mice", "C: 20 tp × 6 mice"]
+config_keys  = ["A_5x24", "B_10x12", "C_20x6"]
+
+# Fine-grid true solution for smooth curves
+t_plot = Float32.(t_fine)
+
+for (col, key) in enumerate(config_keys)
+    cfg = configs[key]
+    for row in 1:3
+        ax = Makie.Axis(
+            fig[row, col];
+            title  = col == 1 ? state_labels[row] : "",
+            xlabel = row == 3 ? "Days post-infection" : "",
+            ylabel = col == 1 ? "Concentration" : "",
+            yscale = Makie.pseudolog10,
+            xgridvisible = true, ygridvisible = true,
+            topspinevisible = false, rightspinevisible = false,
+            xticklabelsize = 9, yticklabelsize = 9,
+            titlesize = 11, titlealign = :left,
+        )
+
+        # Config label as column header
+        if row == 1
+            Label(fig[0, col], config_labels[col]; fontsize = 13, tellwidth = false)
+        end
+
+        # True ODE curve
+        lines!(ax, t_plot, sol_array[row, :];
+               color = :black, linewidth = 2, label = "True ODE")
+
+        # Individual mice as translucent scatter
+        for m in 1:cfg.n_mice
+            scatter!(ax, cfg.t_obs, cfg.Y_noisy[row, :, m];
+                     markersize = 5, color = (:steelblue, 0.25))
+        end
+
+        # Mouse-averaged training signal
+        scatter!(ax, cfg.t_obs, cfg.Y_mean[row, :];
+                 markersize = 8, color = :white,
+                 strokecolor = :black, strokewidth = 1.5,
+                 label = "Mean (training)")
+    end
+end
+
+# Shared legend at the bottom
+Legend(fig[4, 1:3],
+       [LineElement(color = :black, linewidth = 2),
+        MarkerElement(marker = :circle, markersize = 5, color = (:steelblue, 0.4)),
+        MarkerElement(marker = :circle, markersize = 8, color = :white,
+                      strokecolor = :black, strokewidth = 1.5)],
+       ["True ODE", "Individual mice", "Mouse mean (training)"],
+       orientation = :horizontal, tellwidth = false)
+
+display(fig)
+
+# save(joinpath(pwd(), "Results", "Baccam_sampling_configs.pdf"), fig; px_per_unit = 600/72)
+#+end_src
+
+#+RESULTS:
+
+** Normalisation: log₁₀ + min-max scaling
+
+All states are floored at a small positive value, log₁₀-transformed, then
+linearly scaled to [0, 1] per state. This is simple, invertible, and puts every
+state on a comparable O(1) footing for the MLP and loss.
+
+#+begin_src julia-vterm
+
+"""
+    LogMinMaxTransform(X; dims=2, floor_val=1f-6, lo=nothing, hi=nothing)
+
+Floor → log₁₀ → min-max scale to [0, 1] along `dims`.
+Returns (Z, lo, hi, floor_val) so the inverse can reconstruct the original.
+When `lo` and `hi` are supplied they are reused (e.g. for the initial condition).
+"""
+function LogMinMaxTransform(X; dims=2, floor_val=1f-6, lo=nothing, hi=nothing)
+    Xf = Float32.(X)
+    Xf = max.(Xf, Float32(floor_val))       # avoid log(0)
+    X_log = log10.(Xf)
+
+    lo = isnothing(lo) ? minimum(X_log; dims=dims) : lo
+    hi = isnothing(hi) ? maximum(X_log; dims=dims) : hi
+    # Guard against constant rows (hi == lo)
+    span = hi .- lo
+    span = ifelse.(span .== 0, one(Float32), span)
+
+    Z = (X_log .- lo) ./ span
+    return (Z=Z, lo=lo, hi=hi, floor_val=Float32(floor_val))
+end
+
+"""
+    InverseLogMinMax(Z, lo, hi)
+
+Undo the log + min-max transform: rescale → 10^(·).
+"""
+function InverseLogMinMax(Z, lo, hi)
+    span = hi .- lo
+    span = ifelse.(span .== 0, one(Float32), span)
+    X_log = Z .* span .+ lo
+    return 10 .^ X_log
+end
+#+end_src
+
+#+RESULTS:
+
+* Building the grey-box architecture
+
+The architecture function encodes the known physics (the I-equation and the
+−c·V sink in the V-equation) while delegating the unknown source/sink terms to
+the learned g-network.
+
+#+begin_src julia-vterm
+
+function BaccamArchitectureNorm(
+    ỹ::AbstractMatrix{<:Real},   # 3×B  normalised (T̃, Ĩ, Ṽ)
+    g̃::AbstractMatrix{<:Real},   # 2×B  learned    (g_T, g_V)
+    p::BaccamParams,
+)
+    @assert size(ỹ, 1) == 3 "ỹ must have 3 states"
+    @assert size(g̃, 1) == 2 "g̃ must have 2 outputs"
+
+    T̃ = ỹ[1, :]
+    Ĩ = ỹ[2, :]
+    Ṽ = ỹ[3, :]
+
+    g_T = g̃[1, :]   # should learn → −β·T·V  (in normalised space)
+    g_V = g̃[2, :]   # should learn → p·I      (in normalised space)
+
+    # Known physics only in the I-equation
+    dT̃ = g_T
+    dĨ = p.β .* T̃ .* Ṽ .- p.δ .* Ĩ
+    dṼ = g_V .- p.c .* Ṽ
+
+    return permutedims(hcat(dT̃, dĨ, dṼ))
+end
+#+end_src
+
+#+RESULTS:
+
+* Initialising the MLPs
+
+The state network maps time → 3 normalised states; the g-network maps time → 2
+unknown source terms. Sizes are kept small to stay under-parameterised relative
+to the training budget.
+
+#+begin_src julia-vterm
+
+# State MLP: t ↦ (T̃, Ĩ, Ṽ)
+# Output uses sigmoid to match the [0, 1] range of min-max scaled targets
+build_state_mlp() = Lux.Chain(
+    Lux.Dense(1, 8, tanh_fast),
+    Lux.Dense(8, 6, tanh_fast),
+    Lux.Dense(6, 3, NNlib.sigmoid_fast)
+)
+
+# Physics-residual MLP: t ↦ (g_T, g_V) — output can be negative
+build_g_mlp() = Lux.Chain(
+    Lux.Dense(1, 6, tanh_fast),
+    Lux.Dense(6, 4, tanh_fast),
+    Lux.Dense(4, 2)
+)
+#+end_src
+
+#+RESULTS:
+
+* Callback for diagnostic logging
+
+The callback records data MSE, ODE MSE, and g-network standard deviation at
+regular intervals during training. The history vectors are stored in a
+dictionary keyed by configuration label so that runs don't clobber each other.
+
+#+begin_src julia-vterm
+
+# Global store: config label → NamedTuple of history vectors
+diag_histories = Dict{String, NamedTuple}()
+
+"""
+    make_baccam_callback(label; log_every=25, print_every=25_000)
+
+Return a callback closure that logs loss diagnostics into `diag_histories[label]`.
+Prints a status line every `print_every` iterations.
+"""
+function make_baccam_callback(label; log_every=25, print_every=25_000)
+    # Fresh history vectors for this config
+    hist = (
+        iter     = Int[],
+        data_mse = Float32[],
+        ode_mse  = Float32[],
+        g_std    = Float32[],
+    )
+    diag_histories[label] = hist
+
+    function cb(state, l)
+        if state.iter % log_every == 0
+            # Progress printout at coarser intervals
+            if state.iter % print_every == 0
+                println("  [$label] iter=$(state.iter)")
+            end
+
+            ps  = state.u
+            ctx = state.p
+
+            d_mse = loss_Data(ps, ctx)
+
+            # ODE and g metrics are only meaningful in Stage 2
+            if ctx isa PINNCtxStage2
+                o_mse = loss_ODE(ps, ctx, BaccamArchitectureNorm, BaccamParams)
+                gmodel = g_model(ps, ctx)
+                g_out  = gmodel(ctx.t_dense)
+                g_s    = std(vec(g_out))
+            else
+                o_mse = NaN32
+                g_s   = NaN32
+            end
+
+            push!(hist.iter,     state.iter)
+            push!(hist.data_mse, d_mse)
+            push!(hist.ode_mse,  o_mse)
+            push!(hist.g_std,    g_s)
+        end
+        return false
+    end
+
+    return cb
+end
+#+end_src
+
+#+RESULTS:
+
+* Running the experiment across all three configurations
+
+The three configs are independent — no shared trainable state — so we spawn
+each onto its own thread. Start Julia with at least 3 threads
+(~julia -t 3~ or ~export JULIA_NUM_THREADS=3~) for full parallelism.
+
+BLAS threads are pinned to 1 per task so that the per-config optimisers don't
+fight over the same BLAS thread pool.
+
+#+begin_src julia-vterm
+
+using LinearAlgebra
+# Pin BLAS to 1 thread so spawned tasks don't contend over a shared pool
+BLAS.set_num_threads(1)
+
+# Hyperparameters (shared across all configs for a fair comparison)
+hp = HyperParams(
+    1.0f0 / 2.0f0,     # ϵ_ic
+    1.0f0 / 10.0f0,    # ϵ_ode
+    1.0f0 / 25.0f0,    # ϵ_Data
+    1.0f0 / √(50f-2), # ϵ_L1
+)
+
+"""
+    train_config(label, cfg, hp, u0, t_span)
+
+Prepare normalised data and run the two-stage training for a single sampling
+configuration. Returns everything needed for downstream analysis.
+"""
+function train_config(label, cfg, hp, u0, t_span)
+    println("\n" * "="^60)
+    println("  [Thread $(Threads.threadid())] Training: $label")
+    println("  Timepoints = $(cfg.n_tp),  Mice/tp = $(cfg.n_mice)")
+    println("="^60)
+
+    t_train = permutedims(cfg.t_obs)       # 1 × n_tp
+    Y_train_raw = cfg.Y_mean               # 3 × n_tp
+
+    # --- Normalisation: log10 + min-max to [0,1] ---
+    lmm = LogMinMaxTransform(Y_train_raw; dims = 2)
+    Y_train = lmm.Z
+
+    # Apply the same transform to the initial condition
+    y0_init = LogMinMaxTransform(
+        reshape(u0, :, 1); dims = 2,
+        lo = lmm.lo, hi = lmm.hi, floor_val = lmm.floor_val
+    ).Z |> vec
+
+    # Dense collocation grid for the ODE residual loss
+    t_dense = permutedims(Float32.(range(
+        minimum(t_train), maximum(t_train); length = 1000
+    )))
+    t_span_vec = Float32[minimum(t_train), maximum(t_train)]
+
+    # Initial guesses for the known ODE parameters
+    guess_params = BaccamParams(1.0f-4, 1.0f0, 1.0f0)
+
+    # Parameter bounds (generous to test discovery)
+    β_bounds = Float32[0f0, 1f-2]
+    δ_bounds = Float32[0f0, 20f0]
+    c_bounds = Float32[0f0, 20f0]
+
+    data = (
+        t_train        = t_train,
+        Y_train        = Y_train,
+        Y_train_std    = ones(Float32, 3, 1),
+        t_dense        = t_dense,
+        t_span         = t_span_vec,
+        y0_init        = y0_init,
+        ODE_par_init   = (β = guess_params.β, δ = guess_params.δ, c = guess_params.c),
+        ODE_par_bounds = (β = β_bounds, δ = δ_bounds, c = c_bounds),
+    )
+
+    # Per-config callback — writes to its own slot in diag_histories
+    cb = make_baccam_callback(label; log_every = 25, print_every = 25_000)
+
+    stats = @timed res = train_fixed_hyper(
+        data,
+        BaccamArchitectureNorm,
+        BaccamParams,
+        hp;
+        user_loss_functions = Function[],
+        maxiters_stage1     = 50_000,
+        maxiters_stage2     = 120_000,
+        Opt_alg_stage1      = OptimizationOptimisers.Adam(1f-4),
+        Opt_alg_stage2      = OptimizationOptimisers.Adam(1f-4),
+        callback_function   = cb,
+    )
+
+    println("  [$label] Wall time: $(round(stats.time; digits=1)) s")
+    println("  [$label] Data MSE:  $(res.metrics.data_mse)")
+    println("  [$label] ODE MSE:   $(res.metrics.ode_mse)")
+    println("  [$label] Recovered β = $(res.params.ODE_par.β)")
+    println("  [$label] Recovered δ = $(res.params.ODE_par.δ)")
+    println("  [$label] Recovered c = $(res.params.ODE_par.c)")
+
+    return (
+        res    = res,
+        lmm    = lmm,
+        cfg    = cfg,
+        data   = data,
+        time_s = stats.time,
+    )
+end
+
+# Spawn all three configs as independent tasks
+println("Launching $(length(configs)) configs on $(Threads.nthreads()) threads...")
+tasks = Dict(
+    label => Threads.@spawn(train_config(label, cfg, hp, u0, t_span))
+    for (label, cfg) in configs
+)
+
+# Block until all tasks finish and collect results
+results = Dict(label => fetch(task) for (label, task) in tasks)
+println("\nAll configurations complete.")
+#+end_src
+
+#+RESULTS:
+
+* Comparing recovered parameters across configurations
+
+#+begin_src julia-vterm
+
+println("\n", "="^70)
+println("  Parameter Recovery Summary")
+println("="^70)
+@printf("%-12s %-20s %-16s %-16s %-12s %s\n",
+        "Config", "β (true 2.7e-5)", "δ (true 4.0)", "c (true 3.0)",
+        "Data MSE", "ODE MSE")
+println("-"^70)
+
+for label in ["A_5x24", "B_10x12", "C_20x6"]
+    r = results[label].res
+    @printf("%-12s β=%.2e  δ=%.3f  c=%.3f  D=%.4f  O=%.4f\n",
+            label,
+            r.params.ODE_par.β,
+            r.params.ODE_par.δ,
+            r.params.ODE_par.c,
+            r.metrics.data_mse,
+            r.metrics.ode_mse)
+end
+#+end_src
+
+#+RESULTS:
+: 
+: ======================================================================
+:   Parameter Recovery Summary
+: ======================================================================
+: Config       β (true 2.7e-5)      δ (true 4.0)     c (true 3.0)     Data MSE     ODE MSE
+: ----------------------------------------------------------------------
+: A_5x24       β=6.39e-01  δ=0.206  c=0.211  D=0.0004  O=0.0009
+: B_10x12      β=1.02e+00  δ=0.255  c=0.060  D=0.0012  O=0.0024
+: C_20x6       β=7.01e-01  δ=0.225  c=0.169  D=0.0066  O=0.0028
+
+* Visualising training diagnostics
+
+Loss curves for all three configurations side by side. The vertical dashed line
+marks the transition from Stage 1 (supervised) to Stage 2 (ODE-regularised).
+NaN values (ODE MSE and g_std during Stage 1) are filtered out.
+
+#+begin_src julia-vterm
+
+fig = Figure(size = (1200, 400), fontsize = 12)
+
+metric_labels = ["Data MSE", "ODE MSE", "g_std"]
+config_keys   = ["A_5x24", "B_10x12", "C_20x6"]
+config_colors = [:royalblue, :firebrick, :forestgreen]
+
+# Stage 1 → Stage 2 boundary (same for all configs in this run)
+stage1_iters = 50_000
+
+for (midx, field) in enumerate([:data_mse, :ode_mse, :g_std])
+    ax = Makie.Axis(fig[1, midx];
+              title  = metric_labels[midx],
+              xlabel = "Iteration",
+              ylabel = midx == 1 ? "Loss" : "",
+              yscale = Makie.log10,
+              xgridvisible = true, ygridvisible = true,
+              topspinevisible = false, rightspinevisible = false,
+              xticklabelsize = 9, yticklabelsize = 9,
+              titlesize = 12, titlealign = :left)
+
+    # Stage boundary marker
+    vlines!(ax, [stage1_iters]; color = :grey50, linestyle = :dash, linewidth = 1)
+
+    for (cidx, key) in enumerate(config_keys)
+        hist = diag_histories[key]
+        iters = hist.iter
+        vals  = getfield(hist, field)
+
+        # Filter out NaN entries (Stage 1 has NaN for ode_mse and g_std)
+        mask = .!isnan.(vals)
+        lines!(ax, iters[mask], vals[mask];
+               color = config_colors[cidx], linewidth = 1.5,
+               label = key)
+    end
+
+    # Legend only on the first panel to avoid clutter
+    if midx == 1
+        axislegend(ax; position = :rt, labelsize = 9)
+    end
+end
+
+display(fig)
+
+# save(joinpath(pwd(), "Results", "Baccam_training_diagnostics.pdf"), fig; px_per_unit = 600/72)
+#+end_src
+
+#+RESULTS:
+
+* Visualising the fits for each configuration
+
+#+begin_src julia-vterm
+
+fig = Figure(size = (1200, 700), fontsize = 12)
+
+state_labels = ["Target T(t)", "Infected I(t)", "Virus V(t)"]
+config_labels_short = ["A: 5×12", "B: 10×6", "C: 20×3"]
+config_keys  = ["A_5x24", "B_10x12", "C_20x6"]
+
+for (col, key) in enumerate(config_keys)
+    r   = results[key]
+    res = r.res
+    lmm = r.lmm
+    cfg = r.cfg
+
+    # Evaluate state MLP on a dense grid and invert to original scale
+    smodel = state_model(res.params, res.ctx2)
+    t_eval = permutedims(Float32.(range(t_span[1], t_span[2]; length = 300)))
+    ŷ_norm = smodel(t_eval)
+    ŷ_real = InverseLogMinMax(ŷ_norm, lmm.lo, lmm.hi)
+
+    for row in 1:3
+        ax = Makie.Axis(
+            fig[row, col];
+            title  = col == 1 ? state_labels[row] : "",
+            xlabel = row == 3 ? "Days post-infection" : "",
+            ylabel = col == 1 ? "Concentration" : "",
+            yscale = Makie.pseudolog10,
+            xgridvisible = true, ygridvisible = true,
+            topspinevisible = false, rightspinevisible = false,
+            xticklabelsize = 9, yticklabelsize = 9,
+            titlesize = 11, titlealign = :left,
+        )
+        if row == 1
+            Label(fig[0, col], config_labels_short[col];
+                  fontsize = 13, tellwidth = false)
+        end
+
+        # True ODE
+        lines!(ax, t_fine, sol_array[row, :];
+               color = :grey60, linewidth = 1.5, linestyle = :dash)
+
+        # NN fit (original scale)
+        lines!(ax, vec(t_eval), ŷ_real[row, :];
+               color = :black, linewidth = 2)
+
+        # Training data (mouse-averaged, original scale)
+        scatter!(ax, cfg.t_obs, cfg.Y_mean[row, :];
+                 markersize = 7, color = :white,
+                 strokecolor = :black, strokewidth = 1.5)
+    end
+end
+
+Legend(fig[4, 1:3],
+       [LineElement(color = :grey60, linewidth = 1.5, linestyle = :dash),
+        LineElement(color = :black, linewidth = 2),
+        MarkerElement(marker = :circle, markersize = 7, color = :white,
+                      strokecolor = :black, strokewidth = 1.5)],
+       ["True ODE", "NN(t, θ_u)", "Training data"],
+       orientation = :horizontal, tellwidth = false)
+
+display(fig)
+
+# save(joinpath(pwd(), "Results", "Baccam_fits_comparison.pdf"), fig; px_per_unit = 600/72)
+#+end_src
+
+#+RESULTS:
+
+* Visualising the recovered g-functions
+
+For each configuration we plot the learned $g_T(t)$ and $g_V(t)$.
+
+#+begin_src julia-vterm
+
+fig = Figure(size = (1200, 400), fontsize = 12)
+
+for (col, key) in enumerate(config_keys)
+    r   = results[key]
+    res = r.res
+
+    # Evaluate g-MLP on the dense grid
+    gmodel = g_model(res.params, res.ctx2)
+    t_eval = permutedims(Float32.(range(t_span[1], t_span[2]; length = 300)))
+    gŷ = gmodel(t_eval)   # 2 × 300
+
+    # g_T
+    ax1 = Makie.Axis(fig[1, col];
+               title = "g_T  ($key)", xlabel = "Days p.i.",
+               xgridvisible = true, ygridvisible = true,
+               topspinevisible = false, rightspinevisible = false,
+               xticklabelsize = 9, yticklabelsize = 9,
+               titlesize = 11, titlealign = :left)
+    lines!(ax1, vec(t_eval), vec(gŷ[1, :]); color = :black, linewidth = 2)
+
+    # g_V
+    ax2 = Makie.Axis(fig[2, col];
+               title = "g_V  ($key)", xlabel = "Days p.i.",
+               xgridvisible = true, ygridvisible = true,
+               topspinevisible = false, rightspinevisible = false,
+               xticklabelsize = 9, yticklabelsize = 9,
+               titlesize = 11, titlealign = :left)
+    lines!(ax2, vec(t_eval), vec(gŷ[2, :]); color = :black, linewidth = 2)
+end
+
+Label(fig[0, 1:3], "Learned unknown physics  g(t, θ_g)"; fontsize = 14, tellwidth = false)
+
+display(fig)
+
+# save(joinpath(pwd(), "Results", "Baccam_g_comparison.pdf"), fig; px_per_unit = 600/72)
+#+end_src
+
+#+RESULTS:
+
+* Symbolic regression on the recovered g-functions
+
+We extract the state and g-network outputs on the dense training grid and use
+~SymbolicRegression.jl~ to distil closed-form expressions. This is run
+independently for each configuration to compare how sampling design affects the
+quality of symbolic recovery.
+
+#+begin_src julia-vterm
+
+using SymbolicRegression
+
+for key in config_keys
+    col_idx = findfirst(==(key), config_keys)
+    label = config_labels[col_idx]
+    println("\n", "="^60)
+    println("  Symbolic regression for $label")
+    println("="^60)
+
+    r   = results[key]
+    res = r.res
+
+    # State and g models on the dense grid
+    smodel = state_model(res.params, res.ctx2)
+    gmodel = g_model(res.params, res.ctx2)
+
+    t_dense = res.ctx2.t_dense
+    Ỹ = smodel(t_dense)     # 3 × B  (normalised states)
+    G̃ = gmodel(t_dense)     # 2 × B  (learned g_T, g_V)
+
+    # Feature matrix: all three normalised states as rows
+    X = Float64.(Array(Ỹ))   # 3 × B
+
+    # ---- Recover g_T (should find ∝ T·V) ----
+    println("  >> Searching for g_T ...")
+    opts_gT = SymbolicRegression.Options(
+        binary_operators = [+, -, *],
+        unary_operators  = [],
+        npopulations     = 30,
+        maxsize          = 20,
+    )
+    hof_gT = SymbolicRegression.EquationSearch(
+        X, Float64.(vec(G̃[1, :]));
+        niterations    = 200,
+        options        = opts_gT,
+        progress       = false,
+        variable_names = ["T_norm", "I_norm", "V_norm"],
+    )
+    pareto_gT = SymbolicRegression.calculate_pareto_frontier(hof_gT)
+    println("  g_T Pareto front ($(length(pareto_gT)) expressions):")
+    for m in pareto_gT
+        println("    complexity=$(m.complexity)  loss=$(round(m.loss; sigdigits=4))  $(m.tree)")
+    end
+
+    # ---- Recover g_V (should find ∝ I) ----
+    println("  >> Searching for g_V ...")
+    opts_gV = SymbolicRegression.Options(
+        binary_operators = [+, -, *],
+        unary_operators  = [],
+        npopulations     = 30,
+        maxsize          = 20,
+    )
+    hof_gV = SymbolicRegression.EquationSearch(
+        X, Float64.(vec(G̃[2, :]));
+        niterations    = 200,
+        options        = opts_gV,
+        progress       = false,
+        variable_names = ["T_norm", "I_norm", "V_norm"],
+    )
+    pareto_gV = SymbolicRegression.calculate_pareto_frontier(hof_gV)
+    println("  g_V Pareto front ($(length(pareto_gV)) expressions):")
+    for m in pareto_gV
+        println("    complexity=$(m.complexity)  loss=$(round(m.loss; sigdigits=4))  $(m.tree)")
+    end
+end
+#+end_src
+
+* Summary and interpretation
+
+The three configurations test how temporal resolution versus replicate depth
+trade off when the total observation budget is fixed:
+
+- *Config A (5 × 12)*: Very few timepoints but many mice. The per-timepoint
+  mean is accurate (low noise), but the temporal dynamics are poorly resolved.
+  This is the hardest setting for the ODE-residual loss, which relies on smooth
+  time derivatives estimated by finite differences.
+
+- *Config B (10 × 6)*: A balanced design. Moderate noise reduction via
+  averaging, with enough temporal coverage for the finite-difference ODE loss to
+  work reasonably.
+
+- *Config C (20 × 3)*: Dense temporal coverage with only three mice per point.
+  The training signal is noisier, but the optimiser has many collocation-like
+  anchor points and can resolve the dynamics well.
+
+The key metric is whether symbolic regression can recover the ground-truth
+functional forms $g_T = -\beta\,T\,V$ and $g_V = p\,I$ from the learned
+g-network. We expect Config C (wide) to favour recovery because PINNs and
+finite-difference ODE losses benefit from dense temporal sampling, while Config
+A (lean) may struggle despite having cleaner per-point estimates.

@@ -70,22 +70,22 @@ g_model(ps, ctx::PINNCtxStage2) =
     Lux.StatefulLuxLayer(ctx.g_MLP, ps.gMLP, ctx.st_gMLP)
 
 
-# function metrics_stage2(ps, ctx::PINNCtxStage2, architecture::Function, ODE_params)
-#     smodel  = state_model(ps, ctx)
-#     gmodel  = g_model(ps, ctx)
-#     data_mse = MSE(smodel(ctx.t_train), ctx.Y_train, ctx.Y_train_std)
+function metrics_stage2(ps, ctx::PINNCtxStage2, architecture::Function, ODE_params)
+    smodel  = state_model(ps, ctx)
+    gmodel  = g_model(ps, ctx)
+    data_mse = MSE(smodel(ctx.t_train), ctx.Y_train, ctx.Y_train_std)
 
-#     ODE_par = ODE_params(ps.ODE_par)
-#     Tdense  = ctx.t_dense
-#     dNNdt   = dNNdt_fd(smodel, vec(Tdense))
-#     f_ŷ     = architecture(smodel(Tdense), gmodel(Tdense), ODE_par)
-#     ode_mse = MSE(dNNdt, f_ŷ, std(dNNdt; dims = 2))
+    ODE_par = ODE_params(ps.ODE_par)
+    Tdense  = ctx.t_dense
+    dNNdt   = dNNdt_fd(smodel, vec(Tdense))
+    f_ŷ     = architecture(smodel(Tdense), gmodel(Tdense), ODE_par)
+    ode_mse = MSE(dNNdt, f_ŷ, std(dNNdt; dims = 2))
 
-#     g_out   = gmodel(Tdense)
-#     g_std   = std(vec(g_out))
+    g_out   = gmodel(Tdense)
+    g_std   = std(vec(g_out))
 
-#     return data_mse, ode_mse, g_std
-# end
+    return data_mse, ode_mse, g_std
+end
 
 # callback_function_default = (state, l) -> false 
 
@@ -167,7 +167,12 @@ function build_contexts(State_MLP, st_StateMLP, g_MLP, st_gMLP, data, hp::HyperP
     return ctx_stage1, ctx_stage2
 end
 
-function run_stage1(initial_params, ctx_stage1, Opt_alg_stage1, maxiters_stage1, default_supervised_loss, callback_function)
+function run_stage1(initial_params,
+                    ctx_stage1,
+                    Opt_alg_stage1,
+                    maxiters_stage1,
+                    default_supervised_loss,
+                    callback_function)
     println("########## Starting Stage 1: Supervised Training ##########")
     optfun1 = make_optfun(default_supervised_loss)
     prob1   = Optimization.OptimizationProblem(optfun1, initial_params, ctx_stage1)
