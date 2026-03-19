@@ -1,14 +1,15 @@
 #+TITLE: Baccam Model — Grey-box Recovery with Sampling Design Exploration
 #+AUTHOR: Ramakrishna Suresh
-#+PROPERTY: header-args:julia-vterm :session *julia* :results output :exports both :dir (projectile-project-root) :tangle yes :comments both
+#+PROPERTY: header-args:julia-vterm :results output :exports both :dir (projectile-project-root) :tangle yes :comments both
+#+PROPERTY: :session *julia-Baccam*
 #+STARTUP: inlineimages overview
 
 * Setup
 ** Background
 
 This notebook applies the AI-Aristotle-style grey-box identification framework
-to the target cell-limited model of influenza A virus infection from Baccam et
-al. (2006), /J. Virol./ 80(15):7590–7599.
+to the target cell-limited model of influenza A virus infection from Baccam
+et al. (2006), /J. Virol./ 80(15):7590–7599.
 
 The model tracks three populations — target epithelial cells (T), productively
 infected cells (I), and free virus (V) — and was originally fit to nasal wash
@@ -88,6 +89,8 @@ using Pkg;
 Pkg.activate(".")
 #+end_src
 
+#+RESULTS:
+
 #+begin_src julia-vterm :results nil
 using ComponentArrays
 using Lux, NNlib
@@ -107,6 +110,8 @@ include(
     joinpath(pwd(), "Src", "Fitting.jl")
 )
 #+end_src
+
+#+RESULTS:
 
 ** Defining the Baccam model and parameter struct
 
@@ -436,24 +441,49 @@ build_g_mlp() = Lux.Chain(
 
 #+RESULTS:
 
-* Callback for diagnostic logging
+* Callback with stage-end visualization
 
-The callback records data MSE, ODE MSE, and g-network standard deviation at
-regular intervals during training. The history vectors are stored in a
-dictionary keyed by configuration label so that runs don't clobber each other.
+The callback logs scalar metrics (data MSE, ODE MSE, g-network spread) at
+regular intervals, and additionally produces a full state-network fit plot at
+the *end* of Stage 1 and Stage 2. This lets you visually inspect how much the
+ODE-regularised stage improves the pure data-fitting result.
+
+The callback factory takes the ~LogMinMaxTransform~ result, the sampling config,
+and the ground-truth ODE solution so that it can invert the normalised NN
+predictions back to original scale for plotting.
 
 #+begin_src julia-vterm
 
 # Global store: config label → NamedTuple of history vectors
 diag_histories = Dict{String, NamedTuple}()
 
-"""
-    make_baccam_callback(label; log_every=25, print_every=25_000)
+# Global store: config label → snapshot figures for optional saving
+diag_figures = Dict{String, NamedTuple}()
 
-Return a callback closure that logs loss diagnostics into `diag_histories[label]`.
-Prints a status line every `print_every` iterations.
 """
-function make_baccam_callback(label; log_every=25, print_every=25_000)
+    make_baccam_callback(label, lmm, cfg, sol_array, t_fine, t_span;
+                         log_every=25, print_every=25_000,
+                         maxiters_stage1=50_000, maxiters_stage2=120_000)
+
+Return a callback closure that:
+  1. Logs loss diagnostics into `diag_histories[label]` every `log_every` iters.
+  2. Snapshots the state-network fit at the *end* of Stage 1 and Stage 2,
+     plotting the NN prediction (original scale) against the true ODE and
+     training data.
+
+Arguments:
+  - `lmm`: LogMinMaxTransform result for inverting normalised predictions.
+  - `cfg`: sampling-config NamedTuple (t_obs, Y_mean, etc.).
+  - `sol_array`: 3×N_fine ground-truth ODE solution for overlay.
+  - `t_fine`: fine time grid matching sol_array columns.
+"""
+function make_baccam_callback(
+    label, lmm, cfg, sol_array, t_fine, t_span;
+    log_every       = 25,
+    print_every     = 25_000,
+    maxiters_stage1 = 50_000,
+    maxiters_stage2 = 120_000,
+)
     # Fresh history vectors for this config
     hist = (
         iter     = Int[],
@@ -463,9 +493,76 @@ function make_baccam_callback(label; log_every=25, print_every=25_000)
     )
     diag_histories[label] = hist
 
+    # Iteration counts at which each stage ends (optimizer counts from 1)
+    stage1_end = maxiters_stage1
+    stage2_end = maxiters_stage2
+
+    state_labels = ["Target T(t)", "Infected I(t)", "Virus V(t)"]
+
+    # ---- Helper: produce a 3-panel fit snapshot ----
+    function snapshot_fit(ps, ctx, stage_name)
+        smodel_snap = state_model(ps, ctx)
+
+        # Dense evaluation grid spanning the training window
+        t_eval = permutedims(Float32.(range(t_span[1], t_span[2]; length = 300)))
+        tvec   = vec(t_eval)
+
+        # NN prediction → invert normalisation to original scale
+        ŷ_norm = smodel_snap(t_eval)
+        ŷ_real = InverseLogMinMax(ŷ_norm, lmm.lo, lmm.hi)
+
+        fig = Figure(size = (900, 700), fontsize = 12)
+        Label(fig[0, 1], "[$label]  $stage_name";
+              fontsize = 14, tellwidth = false)
+
+        for row in 1:3
+            ax = Makie.Axis(
+                fig[row, 1];
+                title  = state_labels[row],
+                xlabel = row == 3 ? "Days post-infection" : "",
+                ylabel = "Concentration",
+                yscale = Makie.pseudolog10,
+                xgridvisible = true, ygridvisible = true,
+                topspinevisible = false, rightspinevisible = false,
+                xticklabelsize = 9, yticklabelsize = 9,
+                titlesize = 11, titlealign = :left,
+            )
+
+            # Ground-truth ODE (dashed grey)
+            lines!(ax, Float32.(t_fine), sol_array[row, :];
+                   color = :grey60, linewidth = 1.5, linestyle = :dash,
+                   label = "True ODE")
+
+            # NN fit in original scale (solid black)
+            lines!(ax, tvec, ŷ_real[row, :];
+                   color = :black, linewidth = 2,
+                   label = "NN(t, θ_u)")
+
+            # Training data — mouse-averaged, original scale
+            scatter!(ax, cfg.t_obs, cfg.Y_mean[row, :];
+                     markersize = 7, color = :white,
+                     strokecolor = :black, strokewidth = 1.5,
+                     label = "Training data")
+        end
+
+        Legend(fig[4, 1],
+               [LineElement(color = :grey60, linewidth = 1.5, linestyle = :dash),
+                LineElement(color = :black, linewidth = 2),
+                MarkerElement(marker = :circle, markersize = 7, color = :white,
+                              strokecolor = :black, strokewidth = 1.5)],
+               ["True ODE", "NN(t, θ_u)", "Training data"],
+               orientation = :horizontal, tellwidth = false)
+
+        # display(fig)
+
+        # Stash for optional post-training save
+        diag_figures["$(label)_$(stage_name)"] = (fig = fig,)
+    end
+
+    # ---- The actual callback closure ----
     function cb(state, l)
+        # --- Periodic metric logging ---
         if state.iter % log_every == 0
-            # Progress printout at coarser intervals
             if state.iter % print_every == 0
                 println("  [$label] iter=$(state.iter)")
             end
@@ -475,11 +572,11 @@ function make_baccam_callback(label; log_every=25, print_every=25_000)
 
             d_mse = loss_Data(ps, ctx)
 
-            # ODE and g metrics are only meaningful in Stage 2
+            # ODE and g metrics only meaningful in Stage 2
             if ctx isa PINNCtxStage2
                 o_mse = loss_ODE(ps, ctx, BaccamArchitectureNorm, BaccamParams)
-                gmodel = g_model(ps, ctx)
-                g_out  = gmodel(ctx.t_dense)
+                gmodel_snap = g_model(ps, ctx)
+                g_out  = gmodel_snap(ctx.t_dense)
                 g_s    = std(vec(g_out))
             else
                 o_mse = NaN32
@@ -491,20 +588,36 @@ function make_baccam_callback(label; log_every=25, print_every=25_000)
             push!(hist.ode_mse,  o_mse)
             push!(hist.g_std,    g_s)
         end
+
+        # --- Stage-end fit snapshots ---
+        ps  = state.u
+        ctx = state.p
+
+        if ctx isa PINNCtxStage1 && state.iter == stage1_end
+            println("  [$label] Snapshotting fit at end of Stage 1")
+            snapshot_fit(ps, ctx, "End of Stage 1")
+        end
+
+        if ctx isa PINNCtxStage2 && state.iter == stage2_end
+            println("  [$label] Snapshotting fit at end of Stage 2")
+            snapshot_fit(ps, ctx, "End of Stage 2")
+        end
+
         return false
     end
 
     return cb
 end
+
 #+end_src
 
 #+RESULTS:
 
-* Running the experiment across all three configurations
+* Run
+** Running the experiment across all three configurations
 
 The three configs are independent — no shared trainable state — so we spawn
-each onto its own thread. Start Julia with at least 3 threads
-(~julia -t 3~ or ~export JULIA_NUM_THREADS=3~) for full parallelism.
+each onto its own thread. Ensure to start the Julia REPL with multiple threads.
 
 BLAS threads are pinned to 1 per task so that the per-config optimisers don't
 fight over the same BLAS thread pool.
@@ -519,17 +632,23 @@ BLAS.set_num_threads(1)
 hp = HyperParams(
     1.0f0 / 2.0f0,     # ϵ_ic
     1.0f0 / 10.0f0,    # ϵ_ode
-    1.0f0 / 25.0f0,    # ϵ_Data
-    1.0f0 / √(50f-2), # ϵ_L1
+    1.0f0 / 125.0f0,    # ϵ_Data
+    1.0f0 / √(10), # ϵ_L1
 )
 
+# Training iteration counts — defined here so they're shared between
+# the train_config driver and the callback's stage-end detection logic.
+const MAXITERS_STAGE1 = 50_000
+const MAXITERS_STAGE2 = 120_000
+
 """
-    train_config(label, cfg, hp, u0, t_span)
+    train_config(label, cfg, hp, u0, t_span, sol_array, t_fine)
 
 Prepare normalised data and run the two-stage training for a single sampling
-configuration. Returns everything needed for downstream analysis.
+configuration. `sol_array` and `t_fine` are threaded through to the callback
+so it can overlay ground-truth on the stage-end snapshot plots.
 """
-function train_config(label, cfg, hp, u0, t_span)
+function train_config(label, cfg, hp, u0, t_span, sol_array, t_fine)
     println("\n" * "="^60)
     println("  [Thread $(Threads.threadid())] Training: $label")
     println("  Timepoints = $(cfg.n_tp),  Mice/tp = $(cfg.n_mice)")
@@ -573,8 +692,14 @@ function train_config(label, cfg, hp, u0, t_span)
         ODE_par_bounds = (β = β_bounds, δ = δ_bounds, c = c_bounds),
     )
 
-    # Per-config callback — writes to its own slot in diag_histories
-    cb = make_baccam_callback(label; log_every = 25, print_every = 25_000)
+    # Callback with stage-end visualization — needs lmm and ground truth
+    cb = make_baccam_callback(
+        label, lmm, cfg, sol_array, t_fine, t_span;
+        log_every       = 25,
+        print_every     = 25_000,
+        maxiters_stage1 = MAXITERS_STAGE1,
+        maxiters_stage2 = MAXITERS_STAGE2,
+    )
 
     stats = @timed res = train_fixed_hyper(
         data,
@@ -582,8 +707,8 @@ function train_config(label, cfg, hp, u0, t_span)
         BaccamParams,
         hp;
         user_loss_functions = Function[],
-        maxiters_stage1     = 50_000,
-        maxiters_stage2     = 120_000,
+        maxiters_stage1     = MAXITERS_STAGE1,
+        maxiters_stage2     = MAXITERS_STAGE2,
         Opt_alg_stage1      = OptimizationOptimisers.Adam(1f-4),
         Opt_alg_stage2      = OptimizationOptimisers.Adam(1f-4),
         callback_function   = cb,
@@ -605,10 +730,10 @@ function train_config(label, cfg, hp, u0, t_span)
     )
 end
 
-# Spawn all three configs as independent tasks
+# Spawn all three configs as independent tasks, passing ground-truth arrays
 println("Launching $(length(configs)) configs on $(Threads.nthreads()) threads...")
 tasks = Dict(
-    label => Threads.@spawn(train_config(label, cfg, hp, u0, t_span))
+    label => Threads.@spawn(train_config(label, cfg, hp, u0, t_span, sol_array, t_fine))
     for (label, cfg) in configs
 )
 
@@ -619,7 +744,7 @@ println("\nAll configurations complete.")
 
 #+RESULTS:
 
-* Comparing recovered parameters across configurations
+** Comparing recovered parameters across configurations
 
 #+begin_src julia-vterm
 
@@ -650,11 +775,11 @@ end
 : ======================================================================
 : Config       β (true 2.7e-5)      δ (true 4.0)     c (true 3.0)     Data MSE     ODE MSE
 : ----------------------------------------------------------------------
-: A_5x24       β=6.39e-01  δ=0.206  c=0.211  D=0.0004  O=0.0009
-: B_10x12      β=1.02e+00  δ=0.255  c=0.060  D=0.0012  O=0.0024
-: C_20x6       β=7.01e-01  δ=0.225  c=0.169  D=0.0066  O=0.0028
+: A_5x24       β=6.55e-01  δ=0.206  c=0.317  D=0.0000  O=0.0046
+: B_10x12      β=1.16e+00  δ=0.266  c=-0.000  D=0.0000  O=0.0179
+: C_20x6       β=1.06e+00  δ=0.349  c=0.950  D=0.0002  O=0.1284
 
-* Visualising training diagnostics
+** Visualising training diagnostics
 
 Loss curves for all three configurations side by side. The vertical dashed line
 marks the transition from Stage 1 (supervised) to Stage 2 (ODE-regularised).
@@ -669,7 +794,7 @@ config_keys   = ["A_5x24", "B_10x12", "C_20x6"]
 config_colors = [:royalblue, :firebrick, :forestgreen]
 
 # Stage 1 → Stage 2 boundary (same for all configs in this run)
-stage1_iters = 50_000
+stage1_iters = MAXITERS_STAGE1
 
 for (midx, field) in enumerate([:data_mse, :ode_mse, :g_std])
     ax = Makie.Axis(fig[1, midx];
@@ -710,7 +835,9 @@ display(fig)
 
 #+RESULTS:
 
-* Visualising the fits for each configuration
+** Visualising the final fit results
+
+The final fit $\mathrm{u}$'s predictions are overlayed on the training dataset.
 
 #+begin_src julia-vterm
 
@@ -779,7 +906,7 @@ display(fig)
 
 #+RESULTS:
 
-* Visualising the recovered g-functions
+** Visualising the recovered g-functions
 
 For each configuration we plot the learned $g_T(t)$ and $g_V(t)$.
 
@@ -823,6 +950,29 @@ display(fig)
 #+end_src
 
 #+RESULTS:
+
+** Saving stage-end snapshot figures
+
+The callback stashes all snapshot figures in ~diag_figures~. This block saves
+them to PDF for inclusion in reports.
+
+#+begin_src julia-vterm :results nil
+
+for (key, entry) in diag_figures
+    fname = replace(key, " " => "_")
+    path  = joinpath(pwd(), "Results", "Baccam_snapshot_$(fname).pdf")
+    save(path, entry.fig; px_per_unit = 600/72)
+    println("Saved $path")
+end
+#+end_src
+
+#+RESULTS:
+: Saved /mnt/c/Users/RAS365/OneDrive - University of Pittsburgh/Documents/Research/Projects/PINN-Demo/Results/Baccam_snapshot_B_10x12_End_of_Stage_2.pdf
+: Saved /mnt/c/Users/RAS365/OneDrive - University of Pittsburgh/Documents/Research/Projects/PINN-Demo/Results/Baccam_snapshot_B_10x12_End_of_Stage_1.pdf
+: Saved /mnt/c/Users/RAS365/OneDrive - University of Pittsburgh/Documents/Research/Projects/PINN-Demo/Results/Baccam_snapshot_A_5x24_End_of_Stage_1.pdf
+: Saved /mnt/c/Users/RAS365/OneDrive - University of Pittsburgh/Documents/Research/Projects/PINN-Demo/Results/Baccam_snapshot_A_5x24_End_of_Stage_2.pdf
+: Saved /mnt/c/Users/RAS365/OneDrive - University of Pittsburgh/Documents/Research/Projects/PINN-Demo/Results/Baccam_snapshot_C_20x6_End_of_Stage_2.pdf
+: Saved /mnt/c/Users/RAS365/OneDrive - University of Pittsburgh/Documents/Research/Projects/PINN-Demo/Results/Baccam_snapshot_C_20x6_End_of_Stage_1.pdf
 
 * Symbolic regression on the recovered g-functions
 
@@ -923,3 +1073,8 @@ functional forms $g_T = -\beta\,T\,V$ and $g_V = p\,I$ from the learned
 g-network. We expect Config C (wide) to favour recovery because PINNs and
 finite-difference ODE losses benefit from dense temporal sampling, while Config
 A (lean) may struggle despite having cleaner per-point estimates.
+
+The stage-end snapshot plots (saved in ~Results/~) let you directly compare the
+supervised-only fit (Stage 1) against the ODE-regularised fit (Stage 2). You
+should see Stage 2 smoothing out overfitting artefacts from Stage 1, especially
+for Config A where the sparse timepoints make pure data-fitting underconstrained.
