@@ -118,11 +118,12 @@ function initialize_components(rng, data, hp::HyperParams, build_state_mlp::Func
         StateMLP = ps_StateMLP,
         gMLP     = ps_gMLP,
         ODE_par  = data.ODE_par_init,
-        hyper    = (
-            ϵ_ic   = hp.ϵ_ic,
-            ϵ_ode  = hp.ϵ_ode,
-            ϵ_Data = hp.ϵ_Data,
-            ϵ_L1   = hp.ϵ_L1
+        # log space search might be better conditioned
+        hyper = (
+            log_ϵ_ic   = log(hp.ϵ_ic),
+            log_ϵ_ode  = log(hp.ϵ_ode),
+            log_ϵ_Data = log(hp.ϵ_Data),
+            log_ϵ_L1   = log(hp.ϵ_L1)
         )
     )
 

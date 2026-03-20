@@ -92,17 +92,15 @@ end
 
 
 function self_adaptive_supervised_loss(ps, ctx::PINNCtxStage1)
-    hyperparams = ps.hyper
-    
-    hyper_loss = log(hyperparams.ϵ_ic^2) +
-        log(hyperparams.ϵ_Data^2) +
-        log(hyperparams.ϵ_ode^2) +
-        log(hyperparams.ϵ_L1^2)
 
+    hyperparams = ps.hyper
    
-    ϵ_ic_sq = hyperparams.ϵ_ic^2 + 1f-6
-    ϵ_Data_sq = hyperparams.ϵ_Data^2 + 1f-6
-    # ϵ_L1_sq = hyperparams.ϵ_L1^2 + 1f-6 
+    ϵ_ic_sq   = exp(2f0 * hyperparams.log_ϵ_ic)   + 1f-6
+    ϵ_Data_sq = exp(2f0 * hyperparams.log_ϵ_Data) + 1f-6
+    ϵ_L1_sq   = exp(2f0 * hyperparams.log_ϵ_L1)   + 1f-6
+
+    hyper_loss = 2f0 * hyperparams.log_ϵ_ic +
+        2f0 * hyperparams.log_ϵ_Data
 
     return 0.5 * (
         loss_IC(ps, ctx) / ϵ_ic_sq +
@@ -118,18 +116,17 @@ function self_adaptive_unsupervised_loss(ps, ctx::PINNCtxStage2,
                                          )
 
     hyperparams = ps.hyper
-    hyper_loss = log(hyperparams.ϵ_ic^2) +
-        log(hyperparams.ϵ_Data^2) +
-        log(hyperparams.ϵ_ode^2) +
-        log(hyperparams.ϵ_L1^2)
+    
+    ϵ_ic_sq   = exp(2f0 * hyperparams.log_ϵ_ic)   + 1f-6
+    ϵ_Data_sq = exp(2f0 * hyperparams.log_ϵ_Data) + 1f-6
+    ϵ_ode_sq  = exp(2f0 * hyperparams.log_ϵ_ode)  + 1f-6
+    ϵ_L1_sq   = exp(2f0 * hyperparams.log_ϵ_L1)   + 1f-6
 
-
-    ϵ_ic_sq = hyperparams.ϵ_ic^2 + 1f-6
-    ϵ_Data_sq = hyperparams.ϵ_Data^2 + 1f-6
-    ϵ_ode_sq = hyperparams.ϵ_ode^2 + 1f-6
-    ϵ_L1_sq = hyperparams.ϵ_L1^2 + 1f-6
-
-
+    hyper_loss = 2f0 * hyperparams.log_ϵ_ic +
+        2f0 * hyperparams.log_ϵ_Data +
+        2f0 * hyperparams.log_ϵ_ode +
+        2f0 * hyperparams.log_ϵ_L1
+    
     return 0.5 * (
         loss_IC(ps, ctx) / ϵ_ic_sq +
         loss_Data(ps, ctx) / ϵ_Data_sq +
