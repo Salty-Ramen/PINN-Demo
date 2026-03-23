@@ -89,9 +89,10 @@ function loss_ODE(
     gmodel  = g_model(ps, ctx)
     ODE_par = ODE_param_constructor(ps.ODE_par)
     Tdense  = ctx.t_dense
+    ẑ = smodel(Tdense)
     g_arr = gmodel(Tdense)
     dNNdt   = dNNdt_fd(smodel, vec(Tdense))         # 3×B
-    f_ŷ     = architecture(smodel(Tdense), g_arr, ODE_par)
+    f_ŷ     = transformed_rhs(ctx.transform, ẑ, g_arr, ODE_par, architecture)
     ODE_MSE  = MSE(dNNdt, f_ŷ, std(dNNdt; dims =2))
 
     return ODE_MSE
