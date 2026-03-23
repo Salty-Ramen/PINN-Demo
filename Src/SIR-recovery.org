@@ -301,47 +301,44 @@ has the following governing equations:
 \end{subequations}
 
 
-We create a function ~SIRarchitecturenorm~ which takes in ~y~ and ~g~, of an
-~AbstractMatrix{<:Real}~ datatype, along with ~p~, which should be an ~SIRParams~
-struct object. This function takes y and g to calculate the $\frac{dy}{dt}$ matrix.
+We create a raw-state RHS function ~SIRArchitectureRaw~ which takes in ~y~ and
+~g~, of an ~AbstractMatrix{<:Real}~ datatype, along with ~p~, which should be
+an ~SIRParams~ struct object. The state transform wrapper from ~Transforms.jl~
+then maps this raw RHS into the normalized space used by the network and the
+loss functions.
 
 #+begin_src julia-vterm
 
-# Physics parameters in normalized coordinates (I-equation):
-#   dĨ/dt = β * Ŝ - γ * Ĩ
+# Physics parameters in raw coordinates.
 struct SIRParams{T<:AbstractFloat}
-    β::T   # infection rate in normalized I-equation
-    γ::T   # recovery rate  in normalized I-equation
+    β::T
+    γ::T
 end
 
 SIRParams(nt::ComponentVector) = SIRParams(
     nt.β, nt.γ
 )
 
-function SIRArchitectureNorm(
-    ỹ::AbstractMatrix{<:Real},   # 3×B (S̃, Ĩ, R̃)
-    g̃::AbstractMatrix{<:Real},   # 2×B (g_S, g_R)
+function SIRArchitectureRaw(
+    y::AbstractMatrix{<:Real},   # 3×B (S, I, R)
+    g::AbstractMatrix{<:Real},   # 2×B (g_S, g_R)
     p::SIRParams,
 )
-    @assert size(ỹ, 1) == 3 "ỹ must have 3 states (Ŝ, Ĩ, R̃)"
-    @assert size(g̃, 1) == 2 "g̃ must have 2 outputs (g_S, g_R)"
+    @assert size(y, 1) == 3 "y must have 3 states (S, I, R)"
+    @assert size(g, 1) == 2 "g must have 2 outputs (g_S, g_R)"
 
-    S̃ = ỹ[1, :]   
-    Ĩ = ỹ[2, :]
-    # R̃ = ỹ[3, :]   
-    g_S = g̃[1, :]
-    g_R = g̃[2, :]
-    
+    S = y[1, :]
+    I = y[2, :]
+    g_S = g[1, :]
+    g_R = g[2, :]
 
     # Unknown physics in S and R equations:
-    dS̃ = g_S
+    dS = g_S
+    dI = p.β .* S .* I .- p.γ .* I
+    dR = g_R
 
-    dĨ = p.β .* S̃ .* Ĩ .- p.γ .* Ĩ
-
-    dR̃ = g_R
-
-    # Return as 3×B to match the rest of your pipeline
-    return permutedims(hcat(dS̃, dĨ, dR̃))
+    # Return as 3×B to match the rest of your pipeline.
+    return permutedims(hcat(dS, dI, dR))
 end
 
 #+end_src
@@ -383,8 +380,10 @@ aggregate the non-optimized parameters along with data into a ~tuple~.
 
 #+begin_src julia-vterm
 
-# IC in normalized units
-y0_init = Float32.([3, 0.001, 0.0])./Y_max
+# Keep the observed state in raw biological units and let the transform wrapper
+# define the normalized training coordinates seen by the network/losses.
+y0_init_raw = Float32.([3, 0.001, 0.0])
+state_transform = ZScoreTransform(zeros(Float32, size(Y_train_actual, 1)), vec(Y_max))
 
 # Dense time grid and span
 t_dense = permutedims(Float32.(range(
@@ -392,21 +391,20 @@ t_dense = permutedims(Float32.(range(
 )))
 t_span = Float32[minimum(t_train), maximum(t_train)]
 
-# Initial guesses for normalized parameters β_norm, γ
+# Initial guesses for raw parameters β, γ
 guess_SIRparams = SIRParams(1.0f0, 1.0f0)  # choose something reasonable
 
-# Bounds for β, γ (in normalized units)
+# Bounds for β, γ in raw coordinates.
 β_bounds = Float32[0f0, 10f0]
 γ_bounds = Float32[0f0, 10f0]
 
 data = (
-    t_train       = t_train,
-    Y_train       = Y_train,
-    Y_train_std   = permutedims([1,1,1]'),
-    t_dense       = t_dense,
-    t_span        = t_span,
-    y0_init       = y0_init,
-    ODE_par_init  = (
+    t_train        = t_train,
+    Y_train_raw    = Y_train_actual,
+    t_dense        = t_dense,
+    t_span         = t_span,
+    y0_init_raw    = y0_init_raw,
+    ODE_par_init   = (
         β = guess_SIRparams.β,
         γ = guess_SIRparams.γ,
     ),
@@ -475,7 +473,7 @@ function callback_fixed(state, l, Architecture::Function, ODE_params; plot_every
 
         # data times (for scatter) – always from training data
         t_data = vec(ctx.t_train)
-        Y      = ctx.Y_train
+        Y      = inverse_state(ctx.transform, ctx.Y_train)
 
         # prediction times (for trajectories)
         if ctx isa PINNCtxStage1
@@ -484,11 +482,11 @@ function callback_fixed(state, l, Architecture::Function, ODE_params; plot_every
                 collect(range(first(t_data), last(t_data), length=200))
             )
             t_plot     = permutedims(t_plot_vec)      # 1×200 for smodel
-            y_pred     = smodel(t_plot)              # 3×200
+            y_pred     = inverse_state(ctx.transform, smodel(t_plot))  # 3×200 in raw units
         else
             t_plot     = ctx.t_dense                 # 1×Nd
             t_plot_vec = vec(t_plot)                 # Nd
-            y_pred     = smodel(t_plot)             # 3×Nd
+            y_pred     = inverse_state(ctx.transform, smodel(t_plot)) # 3×Nd in raw units
         end
 
         # store trajectory
@@ -532,7 +530,7 @@ end
 
 
 
-callback_fixed_closure = (state, l) -> callback_fixed(state, l, SIRArchitectureNorm, SIRParams)
+callback_fixed_closure = (state, l) -> callback_fixed(state, l, SIRArchitectureRaw, SIRParams)
 # callback_closure = (state, l) -> callback(state, l, LiparuloArchitecture, LiparuloKnownParams)
 
 #+end_src
@@ -577,9 +575,10 @@ iter_counter  = Ref(0)
 
 stats = @timed res = train_fixed_hyper(
     data,
-    SIRArchitectureNorm,
+    SIRArchitectureRaw,
     SIRParams,
     hp;
+    transform          = state_transform,
     user_loss_functions = Function[],
     maxiters_stage1     = 50_000,
     maxiters_stage2     = 120_000,
@@ -609,7 +608,7 @@ t_plot = Float32.(collect(range(first(t_span), last(t_span), length = 200)))
 t_plot = permutedims(t_plot)            # (1, N)
 tvec   = vec(t_plot)                    # (N,)
 
-sŷ = smodel(t_plot)                    # size ≈ (3, length(tvec))
+sŷ = inverse_state(res.ctx2.transform, smodel(t_plot))  # raw-state prediction
 
 # --- Figure + theme ---
 fig = Figure(size = (800, 600), fontsize = 14)
@@ -766,14 +765,15 @@ gmodel = g_model(ps, ctx)
 t_dense = ctx.t_dense              # 1×B, same grid used in training
 t_vec   = vec(t_dense)             # B
 
-# Forward passes (normalized coordinates)
-Ỹ = smodel(t_dense)               # 3×B, (Ŝ, Ĩ, Ř)
+# Forward passes in transformed coordinates, then map back to raw states for SR.
+Ỹ = smodel(t_dense)               # 3×B, transformed coordinates
+Y = inverse_state(ctx.transform, Ỹ)
 G̃ = gmodel(t_dense)               # 2×B, (g_S, g_R) for S and R eqs
 
 # 2. Extract features and targets, promote to Float64 for SR
-Ŝ = Float64.(Ỹ[1, :])
-Ĩ = Float64.(Ỹ[2, :])
-Ř = Float64.(Ỹ[3, :])
+Ŝ = Float64.(Y[1, :])
+Ĩ = Float64.(Y[2, :])
+Ř = Float64.(Y[3, :])
 t = Float64.(t_vec)
 
 g_S = Float64.(G̃[1, :])

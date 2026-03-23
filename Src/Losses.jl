@@ -65,10 +65,9 @@ end
 
 function loss_IC(ps, ctx)
     smodel = state_model(ps, ctx)
-    tspan = ctx.t_span
     init_obs = ctx.y0_obs
-    # This needs to change. Currently is an arbitrary value
-    IC_MSE = MSE(smodel([0f0]'), init_obs, std(init_obs))
+    denom = max.(abs.(init_obs), 1f-6)
+    IC_MSE = MSE(smodel([0f0]'), init_obs, denom)
     return IC_MSE
 end
 
@@ -82,9 +81,10 @@ function loss_ODE(
     gmodel  = g_model(ps, ctx)
     ODE_par = ODE_param_constructor(ps.ODE_par)
     Tdense  = ctx.t_dense
+    ẑ = smodel(Tdense)
     g_arr = gmodel(Tdense)
     dNNdt   = dNNdt_fd(smodel, vec(Tdense))         # 3×B
-    f_ŷ     = architecture(smodel(Tdense), g_arr, ODE_par)
+    f_ŷ     = transformed_rhs(ctx.transform, ẑ, g_arr, ODE_par, architecture)
     ODE_MSE  = MSE(dNNdt, f_ŷ, std(dNNdt; dims =2))
 
     return ODE_MSE
