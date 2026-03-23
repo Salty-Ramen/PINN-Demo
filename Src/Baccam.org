@@ -65,11 +65,11 @@ ethical and budgetary constraints. We simulate this by holding the total
 observation budget $N_{\text{total}} = n_{\text{timepoints}} \times
 n_{\text{mice}}$ constant at 120 and exploring three configurations:
 
-| Configuration | Timepoints | Mice / timepoint | Character        |
-|---------------+------------+-------------------+------------------|
-| A (lean)      |          5 |                24 | Few times, dense replicates |
-| B (balanced)  |         10 |                12 | Moderate both    |
-| C (wide)      |         20 |                 6 | Many times, lean replicates |
+| Configuration | Timepoints | Mice / timepoint | Character                   |
+|---------------+------------+------------------+-----------------------------|
+| A (lean)      |          5 |               24 | Few times, dense replicates |
+| B (balanced)  |         10 |               12 | Moderate both               |
+| C (wide)      |         20 |                6 | Many times, lean replicates |
 
 Each "mouse" is an independent noisy realisation of the ODE solution at that
 timepoint. Noise is log-normal (multiplicative) to reflect biological

@@ -11,10 +11,11 @@ using Base.Threads
 
 #--------Context Structs--------
 struct HyperParams
-    ϵ_ic  :: Float32
-    ϵ_ode :: Float32
-    ϵ_Data:: Float32
-    ϵ_L1  :: Float32
+    ϵ_ic        :: Float32
+    ϵ_ode       :: Float32
+    ϵ_Data      :: Float32
+    ϵ_L1_state  :: Float32
+    ϵ_L1_g      :: Float32
 end
 
 struct PINNCtxStage1{M,ST,T,Y,YS,V}
@@ -26,8 +27,7 @@ struct PINNCtxStage1{M,ST,T,Y,YS,V}
     y0_obs      :: V
     ϵ_ic        :: Float32
     ϵ_Data      :: Float32
-    ϵ_ode       :: Float32
-    ϵ_L1        :: Float32
+    ϵ_L1_state  :: Float32
     t_span      :: Vector{Float32}
 end
 
@@ -40,10 +40,11 @@ struct PINNCtxStage2{M,ST,GM,STG,T,Y,YS,V,TD}
     Y_train        :: Y
     Y_train_std    :: YS
     y0_obs         :: V
-    ϵ_ic        :: Float32
-    ϵ_Data      :: Float32
-    ϵ_ode       :: Float32
-    ϵ_L1        :: Float32
+    ϵ_ic           :: Float32
+    ϵ_Data         :: Float32
+    ϵ_ode          :: Float32
+    ϵ_L1_state     :: Float32
+    ϵ_L1_g         :: Float32
     t_dense        :: TD
     t_span         :: Vector{Float32}
     ODE_par_bounds :: NamedTuple
@@ -120,10 +121,11 @@ function initialize_components(rng, data, hp::HyperParams, build_state_mlp::Func
         ODE_par  = data.ODE_par_init,
         # log space search might be better conditioned
         hyper = (
-            log_ϵ_ic   = log(hp.ϵ_ic),
-            log_ϵ_ode  = log(hp.ϵ_ode),
-            log_ϵ_Data = log(hp.ϵ_Data),
-            log_ϵ_L1   = log(hp.ϵ_L1)
+            log_ϵ_ic       = log(hp.ϵ_ic),
+            log_ϵ_ode      = log(hp.ϵ_ode),
+            log_ϵ_Data     = log(hp.ϵ_Data),
+            log_ϵ_L1_state = log(hp.ϵ_L1_state),
+            log_ϵ_L1_g     = log(hp.ϵ_L1_g)
         )
     )
 
@@ -141,11 +143,10 @@ function build_contexts(State_MLP, st_StateMLP, g_MLP, st_gMLP, data, hp::HyperP
         data.y0_init,
         hp.ϵ_ic,
         hp.ϵ_Data,
-        hp.ϵ_ode,
-        hp.ϵ_L1,
+        hp.ϵ_L1_state,
         data.t_span,
     )
-
+    
     # Context for Stage 2 (ODE-regularized/Unsupervised)
     ctx_stage2 = PINNCtxStage2(
         State_MLP,
@@ -159,7 +160,8 @@ function build_contexts(State_MLP, st_StateMLP, g_MLP, st_gMLP, data, hp::HyperP
         hp.ϵ_ic,
         hp.ϵ_Data,
         hp.ϵ_ode,
-        hp.ϵ_L1,
+        hp.ϵ_L1_state,
+        hp.ϵ_L1_g,
         data.t_dense,
         data.t_span,
         data.ODE_par_bounds,
@@ -229,7 +231,7 @@ function train_once(
     data,
     architecture::Function,
     ode_param_constructor,
-    hp::HyperParams= HyperParams(1f0, 1f0, 1f0, 1);
+    hp::HyperParams= HyperParams(1f0, 1f0, 1f0, 1f0, 1f0);
     user_loss_functions::AbstractVector{<:Function} = Function[], 
     seed::Integer = 1,
     maxiters_stage1::Integer = 10_000,
