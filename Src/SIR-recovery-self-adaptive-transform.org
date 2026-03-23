@@ -1,0 +1,732 @@
+#+TITLE: SIR-recovery (Self-Adaptive Loss Balancing)
+#+AUTHOR: Ramakrishna Suresh
+#+PROPERTY: header-args:julia-vterm :session *julia* :results output :exports both :dir (projectile-project-root) :comment both :tangle yes
+#+STARTUP: inlineimages overview
+
+* Boilerplate
+
+#+begin_src julia-vterm
+using Pkg;
+Pkg.activate(".")
+#+end_src
+
+#+RESULTS:
+
+#+begin_src julia-vterm
+using ComponentArrays
+using Lux, NNlib
+using Optimization, OptimizationOptimisers, OptimizationOptimJL
+using ForwardDiff
+using Statistics
+using Random
+using Base.Threads
+using DifferentialEquations
+using CairoMakie, Makie
+using CSV, DataFrames
+
+include(
+    joinpath(pwd(), "Src", "Fitting.jl")
+)
+#+end_src
+
+#+RESULTS:
+
+* Background: self-adaptive loss balancing
+
+The key difference from the fixed-hyperparameter run (~train_fixed_hyper~) is
+that here we use ~train_once~, which calls ~self_adaptive_supervised_loss~ and
+~self_adaptive_unsupervised_loss~. In these loss functions the weighting
+coefficients ε_ic, ε_Data, ε_ode, and ε_L1 are themselves *trainable
+parameters* — they are stored in ~ps.hyper~ inside the ~ComponentArray~ and are
+updated by the optimiser jointly with the MLP weights and ODE rate constants.
+
+The loss follows a maximum-likelihood / heteroscedastic-noise formulation:
+
+#+NAME: eq:self-adaptive-loss
+\begin{equation}
+\mathcal{L} = \frac{1}{2}\left(
+  \frac{\mathcal{L}_\mathrm{IC}}{\varepsilon_\mathrm{ic}^2} +
+  \frac{\mathcal{L}_\mathrm{data}}{\varepsilon_\mathrm{data}^2} +
+  \frac{\mathcal{L}_\mathrm{ODE}}{\varepsilon_\mathrm{ODE}^2} +
+  \frac{\mathcal{L}_\mathrm{L1}}{\varepsilon_\mathrm{L1}^2}
+  + \log\varepsilon_\mathrm{ic}^2
+  + \log\varepsilon_\mathrm{data}^2
+  + \log\varepsilon_\mathrm{ODE}^2
+  + \log\varepsilon_\mathrm{L1}^2
+\right)
+\end{equation}
+
+The log-ε terms prevent the trivial solution ε → ∞ (which would drive all
+weighted losses to zero). This is the multi-task uncertainty weighting of
+Kendall et al. (2018).
+
+** ⚠ Known structural issues in the current implementation
+
+The following issues are present in the current codebase and should be kept in
+mind when interpreting results:
+
+1. *Unconstrained ε — sign ambiguity.*
+   The ε values are stored as raw floats with no positivity constraint.
+   ~ε²~ is positive regardless, so the weighting is fine, but ~log(ε²)~ is
+   not strictly the intended log-variance penalty when ε can go negative.
+   In particular, the gradient of ~log(ε²)~ w.r.t. ε vanishes as ε → 0,
+   creating a flat region in the loss landscape near zero that can confuse
+   LBFGS.  A simple fix is to optimise ~log(ε)~ directly (i.e., store
+   ~log_ε~ as the trainable variable and exponentiate when needed).
+
+2. *ε_L1 is excluded from Stage 1.*
+   ~self_adaptive_supervised_loss~ sums log terms for all four ε values but
+   only divides by ε_ic and ε_Data (ε_ode and ε_L1 are commented out). This
+   means the optimiser is pushed to reduce ~log(ε_ode²)~ and ~log(ε_L1²)~
+   without any balancing signal from the corresponding residual losses — it
+   will simply minimise those log terms by driving ε_ode, ε_L1 → 0 during
+   Stage 1, leading to very small (and potentially near-zero) initial ε
+   values entering Stage 2.  Either (a) exclude their log terms from the
+   Stage 1 loss, or (b) include their respective residual losses.
+
+3. *HyperParams struct as initialisation only.*
+   The ~hp::HyperParams~ values passed to ~train_once~ are used only to
+   populate ~ps.hyper~ at initialisation; thereafter the optimiser is free
+   to move them. The hp struct is recorded in ~TrainResult.hyper~ but does
+   *not* reflect the final learned values. Post-training, the true ε values
+   should be read from ~res.params.hyper~.
+
+4. *Interaction between self-adaptive ε and LBFGS (Stage 2).*
+   LBFGS builds a local quadratic model and is sensitive to poorly scaled
+   parameters. The ε variables live on a very different scale from MLP
+   weights (which are O(0.1)) and ODE parameters (which may be O(1–100)).
+   Without explicit parameter scaling or a re-parameterisation (see point 1),
+   LBFGS may take very small steps in ε space. Adam (Stage 1) handles this
+   better due to per-parameter adaptive learning rates.
+
+* Creating and saving the toy dataset
+
+We reuse the SIR setup from ~SIR-recovery.org~ verbatim.  The CSV is read
+below; the generation code is kept commented for reference.
+
+#+begin_src julia-vterm
+struct SIRParams{T<:AbstractFloat}
+    β::T   # infection rate
+    γ::T   # recovery rate
+end
+
+# Convenience constructor consumed by the optimiser
+SIRParams(nt::ComponentVector) = SIRParams(nt.β, nt.γ)
+#+end_src
+
+#+RESULTS:
+
+* Reading and normalising the training dataset
+
+#+begin_src julia-vterm
+df = CSV.read(
+    joinpath(pwd(), "Results", "SIR_train.csv"),
+    DataFrame
+)
+
+true_sol = permutedims(Matrix{Float32}(df[:, [:S_true, :I_true, :R_true]]))
+S_true = true_sol[1, :]
+I_true = true_sol[2, :]
+R_true = true_sol[3, :]
+
+Y_train_actual = permutedims(Matrix{Float32}(df[:, [:S, :I, :R]]))
+
+t_train = permutedims(Matrix{Float32}(df[:, [:t]]))
+
+# Normalise by per-state maximum so every state lives in [0, 1]
+Y_max   = maximum(Y_train_actual; dims = 2)
+Y_train = Y_train_actual ./ Y_max
+#+end_src
+
+#+RESULTS:
+
+* Building the architecture
+
+The grey-box formulation is identical to ~SIR-recovery.org~: the S and R
+equations are fully unknown, the I equation retains known physics.
+
+#+NAME: eq:SIR-greybox
+\begin{subequations}
+\begin{align}
+&\frac{dS}{dt} = \mathrm{g}_S(t, \theta_g) \\
+&\frac{dI}{dt} = \beta \cdot S \cdot I - \gamma \cdot I \\
+&\frac{dR}{dt} = \mathrm{g}_R(t, \theta_g)
+\end{align}
+\end{subequations}
+
+#+begin_src julia-vterm
+function SIRArchitectureNorm(
+    ỹ::AbstractMatrix{<:Real},   # 3×B normalised (S̃, Ĩ, R̃)
+    g̃::AbstractMatrix{<:Real},   # 2×B learned    (g_S, g_R)
+    p::SIRParams,
+)
+    @assert size(ỹ, 1) == 3 "ỹ must have 3 states (S̃, Ĩ, R̃)"
+    @assert size(g̃, 1) == 2 "g̃ must have 2 outputs (g_S, g_R)"
+
+    S̃   = ỹ[1, :]
+    Ĩ   = ỹ[2, :]
+    g_S = g̃[1, :]
+    g_R = g̃[2, :]
+
+    dS̃ = g_S
+    dĨ  = p.β .* S̃ .* Ĩ .- p.γ .* Ĩ
+    dR̃ = g_R
+
+    return permutedims(hcat(dS̃, dĨ, dR̃))
+end
+#+end_src
+
+#+RESULTS:
+
+* Initialising the MLPs
+
+#+begin_src julia-vterm
+# State MLP: t → (S̃, Ĩ, R̃); sigmoid forces outputs into [0,1] to match
+# the min-max normalised training targets
+build_state_mlp() = Lux.Chain(
+    Lux.Dense(1, 6, tanh_fast),
+    Lux.Dense(6, 4, tanh_fast),
+    Lux.Dense(4, 3, NNlib.sigmoid_fast)
+)
+
+# Physics-residual MLP: t → (g_S, g_R); unbounded output since both can be negative
+build_g_mlp() = Lux.Chain(
+    Lux.Dense(1, 5, tanh_fast),
+    Lux.Dense(5, 4, tanh_fast),
+    Lux.Dense(4, 2)
+)
+#+end_src
+
+#+RESULTS:
+
+* Aggregating data into a NamedTuple
+
+#+begin_src julia-vterm
+# Initial condition in normalised coordinates
+y0_init = Float32.([3, 0.001, 0.0]) ./ Y_max
+
+# Dense collocation grid for the ODE residual term
+t_dense = permutedims(Float32.(range(
+    minimum(t_train), maximum(t_train), length = 1000
+)))
+t_span  = Float32[minimum(t_train), maximum(t_train)]
+
+# Initial parameter guesses (deliberately offset from truth to test recovery)
+guess_SIRparams = SIRParams(1.0f0, 1.0f0)
+
+# Wide bounds allow the optimiser to explore freely
+β_bounds = Float32[0f0, 10f0]
+γ_bounds = Float32[0f0, 10f0]
+
+data = (
+    t_train        = t_train,
+    Y_train        = Y_train,
+    # Passing all-ones std so MSE is unweighted across states; swap for the
+    # actual per-state std if scale differences between states are large
+    Y_train_std    = permutedims([1, 1, 1]'),
+    t_dense        = t_dense,
+    t_span         = t_span,
+    y0_init        = y0_init,
+    ODE_par_init   = (β = guess_SIRparams.β, γ = guess_SIRparams.γ),
+    ODE_par_bounds = (β = β_bounds, γ = γ_bounds),
+)
+#+end_src
+
+#+RESULTS:
+
+* Diagnostic callback
+
+The callback records scalar loss components and — importantly — the *learned ε
+values* at regular intervals. A live figure is updated every ~plot_every~
+iterations so the fit and ε evolution can be monitored while the optimiser
+runs. The figure layout is:
+
+- Row 1: S(t), I(t), R(t) state fits with trailing trajectory history
+- Row 2: g_S(t), g_R(t) fits against ground truth
+- Row 3: Data MSE, ODE MSE, g std loss curves
+- Row 4: ε_ic, ε_Data, ε_ode, ε_L1 evolution
+
+** Initialise the persistent figure and history stores
+
+#+begin_src julia-vterm
+# --- History vectors (reset before each training run) ---
+data_mse_hist = Float32[]
+ode_mse_hist  = Float32[]
+g_std_hist    = Float32[]
+iter_hist     = Int[]
+
+eps_ic_hist   = Float32[]
+eps_data_hist = Float32[]
+eps_ode_hist  = Float32[]
+eps_L1_hist   = Float32[]
+
+# Trailing trajectory buffer for the state-fit panels (keeps last 10 snapshots)
+trajectory_history = NamedTuple[]
+
+# Ground-truth g values on the training grid (normalised coordinates)
+# Computed once here so the callback doesn't recompute them every iteration
+g1_true_cb = -1.5f0 .* S_true .* I_true ./ Y_max[1]   # g_S true
+g2_true_cb =  1.0f0 .* I_true ./ Y_max[3]              # g_R true
+
+# --- Persistent figure: built once, mutated in the callback ---
+global cb_fig = Figure(size = (1100, 900), fontsize = 11)
+
+# Row 1: state fits
+global cb_axS = Makie.Axis(cb_fig[1, 1]; title = "S(t)")
+global cb_axI = Makie.Axis(cb_fig[1, 2]; title = "I(t)")
+global cb_axR = Makie.Axis(cb_fig[1, 3]; title = "R(t)")
+
+# Row 2: g-function fits
+global cb_axgS = Makie.Axis(cb_fig[2, 1]; title = "g_S(t, θ_g)")
+global cb_axgR = Makie.Axis(cb_fig[2, 2]; title = "g_R(t, θ_g)")
+
+# Row 3: scalar loss curves
+global cb_axDMSE = Makie.Axis(cb_fig[3, 1]; title = "Data MSE",  yscale = log10)
+global cb_axOMSE = Makie.Axis(cb_fig[3, 2]; title = "ODE MSE",   yscale = log10)
+global cb_axGSTD = Makie.Axis(cb_fig[3, 3]; title = "g std",     yscale = log10)
+
+# Row 4: ε evolution
+global cb_axEPS = Makie.Axis(cb_fig[4, 1:3]; title = "Self-adaptive ε weights",
+                       yscale = log10, xlabel = "Iteration")
+#+end_src
+
+#+RESULTS:
+
+** Define the callback function
+
+#+begin_src julia-vterm
+function callback_self_adaptive(state, l, Architecture::Function, ODE_params;
+                                log_every  = 25,
+                                plot_every = 10_000,
+                                print_every = 25_000)
+    if state.iter % log_every != 0
+        return false
+    end
+
+    if state.iter % print_every == 0
+        println("iteration = ", state.iter, "  loss = ", round(l; sigdigits = 4))
+    end
+
+    ps  = state.u
+    ctx = state.p
+
+    # --- Compute and record scalar diagnostics ---
+    d_mse = loss_Data(ps, ctx)
+
+    if ctx isa PINNCtxStage2
+        o_mse = loss_ODE(ps, ctx, Architecture, ODE_params)
+        gmodel_cb = g_model(ps, ctx)
+        g_s       = std(vec(gmodel_cb(ctx.t_dense)))
+    else
+        o_mse = NaN32
+        g_s   = NaN32
+    end
+
+    push!(iter_hist,     state.iter)
+    push!(data_mse_hist, d_mse)
+    push!(ode_mse_hist,  o_mse)
+    push!(g_std_hist,    g_s)
+
+    # Guard: ps.hyper always exists in train_once but we protect against edge cases
+    try
+        h = ps.hyper
+        push!(eps_ic_hist,   abs(h.ϵ_ic))
+        push!(eps_data_hist, abs(h.ϵ_Data))
+        push!(eps_ode_hist,  abs(h.ϵ_ode))
+        push!(eps_L1_hist,   abs(h.ϵ_L1))
+    catch
+    end
+
+    # --- Live plot update ---
+    if state.iter % plot_every != 0
+        return false
+    end
+
+    smodel_cb = state_model(ps, ctx)
+
+    # Build the time vector for predictions
+    t_data_vec = vec(ctx.t_train)
+    if ctx isa PINNCtxStage1
+        t_plot_vec = Float32.(collect(range(first(t_data_vec), last(t_data_vec), length = 200)))
+        t_plot     = permutedims(t_plot_vec)
+    else
+        t_plot     = ctx.t_dense
+        t_plot_vec = vec(t_plot)
+    end
+
+    y_pred = smodel_cb(t_plot)   # 3×N normalised state predictions
+
+    # Maintain rolling trajectory history (last 10 snapshots for fade effect)
+    global trajectory_history
+    push!(trajectory_history, (t = t_plot_vec, y = y_pred))
+    length(trajectory_history) > 10 && popfirst!(trajectory_history)
+
+    # ---- Row 1: state fits ----
+    for ax in (cb_axS, cb_axI, cb_axR)
+        Makie.empty!(ax)
+    end
+
+    scatter!(cb_axS, t_data_vec, ctx.Y_train[1, :]; color = :black, markersize = 5)
+    scatter!(cb_axI, t_data_vec, ctx.Y_train[2, :]; color = :black, markersize = 5)
+    scatter!(cb_axR, t_data_vec, ctx.Y_train[3, :]; color = :black, markersize = 5)
+
+    ntraj = length(trajectory_history)
+    for (k, tr) in enumerate(trajectory_history)
+        α   = 0.15 + 0.65 * (k / ntraj)   # older trajectories more transparent
+        col = (:royalblue, α)
+        lines!(cb_axS, tr.t, tr.y[1, :]; color = col)
+        lines!(cb_axI, tr.t, tr.y[2, :]; color = col)
+        lines!(cb_axR, tr.t, tr.y[3, :]; color = col)
+    end
+
+    # ---- Row 2: g-function fits ----
+    if ctx isa PINNCtxStage2
+        gmodel_cb2 = g_model(ps, ctx)
+        gŷ_cb      = gmodel_cb2(t_plot)   # 2×N
+
+        Makie.empty!(cb_axgS)
+        Makie.empty!(cb_axgR)
+
+        # Learned g (solid black)
+        lines!(cb_axgS, t_plot_vec, vec(gŷ_cb[1, :]); color = :black, linewidth = 2)
+        lines!(cb_axgR, t_plot_vec, vec(gŷ_cb[2, :]); color = :black, linewidth = 2)
+
+        # Ground-truth g (dashed grey) — defined on t_train grid
+        lines!(cb_axgS, t_data_vec, g1_true_cb; color = :grey50, linestyle = :dash, linewidth = 1.5)
+        lines!(cb_axgR, t_data_vec, g2_true_cb; color = :grey50, linestyle = :dash, linewidth = 1.5)
+    end
+
+    # ---- Row 3: loss history curves ----
+    for ax in (cb_axDMSE, cb_axOMSE, cb_axGSTD)
+        Makie.empty!(ax)
+    end
+
+    lines!(cb_axDMSE, iter_hist, data_mse_hist; color = :royalblue, linewidth = 1.2)
+
+    ode_mask = .!isnan.(ode_mse_hist)
+    isany_ode = any(ode_mask)
+    isany_ode && lines!(cb_axOMSE, iter_hist[ode_mask], ode_mse_hist[ode_mask];
+                        color = :firebrick, linewidth = 1.2)
+
+    gstd_mask = .!isnan.(g_std_hist)
+    isany_gstd = any(gstd_mask)
+    isany_gstd && lines!(cb_axGSTD, iter_hist[gstd_mask], g_std_hist[gstd_mask];
+                         color = :forestgreen, linewidth = 1.2)
+
+    # ---- Row 4: ε evolution ----
+    Makie.empty!(cb_axEPS)
+
+    if !isempty(eps_ic_hist)
+        lines!(cb_axEPS, iter_hist[1:length(eps_ic_hist)], eps_ic_hist;
+               label = "ε_ic",   color = :royalblue,   linewidth = 1.5)
+        lines!(cb_axEPS, iter_hist[1:length(eps_data_hist)], eps_data_hist;
+               label = "ε_Data", color = :firebrick,   linewidth = 1.5)
+        lines!(cb_axEPS, iter_hist[1:length(eps_ode_hist)], eps_ode_hist;
+               label = "ε_ode",  color = :forestgreen, linewidth = 1.5)
+        lines!(cb_axEPS, iter_hist[1:length(eps_L1_hist)], eps_L1_hist;
+               label = "ε_L1",   color = :darkorange,  linewidth = 1.5)
+        axislegend(cb_axEPS; position = :rt, labelsize = 9)
+    end
+
+    # display(cb_fig)
+    return false
+end
+
+# Partially apply so the signature matches (state, l) -> Bool
+callback_closure = (state, l) ->
+    callback_self_adaptive(state, l, SIRArchitectureNorm, SIRParams)
+#+end_src
+
+#+RESULTS:
+
+* Hyperparameter initialisation
+
+The values supplied here are *initial* ε values only — they will be updated
+by the optimiser.  Choosing reasonable starting points matters because:
+- Too small → the corresponding loss term dominates early and can derail fitting
+- Too large → the term is effectively ignored early in training (the log penalty
+  pulls ε back, but slowly if the gradient is small)
+
+Good defaults are O(1) for all ε, which is what the unit HyperParams below
+provide.
+
+#+begin_src julia-vterm
+hp = HyperParams(
+    1.0f0,   # ε_ic   — initial IC penalty weight
+    1.0f0,   # ε_ode  — initial ODE residual weight
+    1.0f0,   # ε_Data — initial data fit weight
+    1.0f0,   # ε_L1   — initial L1 regularisation weight
+)
+#+end_src
+
+#+RESULTS:
+
+* Running the optimisation
+
+We use Adam for both stages.  LBFGS is *not* recommended as the Stage 2
+optimiser for the self-adaptive variant because the ε parameters are poorly
+scaled relative to MLP weights (see issue #4 in the Background section).
+
+#+begin_src julia-vterm
+stats = @timed res = train_once(
+    data,
+    SIRArchitectureNorm,
+    SIRParams,
+    hp;
+    user_loss_functions = Function[],
+    seed                = 1,
+    maxiters_stage1     = 50_000,
+    maxiters_stage2     = 120_000,
+    Opt_alg_stage1      = OptimizationOptimisers.Adam(1f-4),
+    Opt_alg_stage2      = OptimizationOptimisers.Adam(1f-4),
+    callback_function   = callback_closure,
+)
+
+println("Training time : $(round(stats.time; digits = 1)) s")
+println("Memory used   : $(round(stats.bytes / 1e6; digits = 1)) MB")
+println()
+println("--- Final metrics ---")
+println("Data MSE : ", res.metrics.data_mse)
+println("ODE MSE  : ", res.metrics.ode_mse)
+println("g std    : ", res.metrics.g_std)
+println()
+println("--- Recovered ODE parameters ---")
+println("β (true 1.5) : ", res.params.ODE_par.β)
+println("γ (true 1.0) : ", res.params.ODE_par.γ)
+println()
+# NOTE: read final ε from res.params.hyper, NOT from hp (see issue #3)
+println("--- Final learned ε values ---")
+println("ε_ic   : ", res.params.hyper.ϵ_ic)
+println("ε_Data : ", res.params.hyper.ϵ_Data)
+println("ε_ode  : ", res.params.hyper.ϵ_ode)
+println("ε_L1   : ", res.params.hyper.ϵ_L1)
+#+end_src
+
+#+RESULTS:
+
+* Final publication-quality figures
+
+The callback already updates a live view during training.  These blocks produce
+clean, saveable figures from the final trained parameters.
+
+** State fit
+
+#+begin_src julia-vterm
+smodel = state_model(res.params, res.ctx2)
+
+t_plot = permutedims(Float32.(collect(range(first(t_span), last(t_span), length = 200))))
+tvec   = vec(t_plot)
+sŷ     = smodel(t_plot)   # (3, 200) normalised predictions
+
+fig = Figure(size = (800, 600), fontsize = 14)
+
+axis_kwargs = (
+    xlabel = "Time t",
+    ylabel = "Population (normalised)",
+    xgridvisible = true,  ygridvisible = true,
+    topspinevisible = false, rightspinevisible = false,
+    xticklabelsize = 10,  yticklabelsize = 10,
+    titlesize = 14,       titlealign = :left,
+)
+
+axS = CairoMakie.Axis(fig[1, 1]; title = "Susceptible S(t)", axis_kwargs...)
+axI = CairoMakie.Axis(fig[2, 1]; title = "Infectious I(t)",  axis_kwargs...)
+axR = CairoMakie.Axis(fig[3, 1]; title = "Recovered R(t)",   axis_kwargs...)
+
+Makie.linkxaxes!(axS, axI, axR)
+
+line_kw    = (color = :black, linewidth = 2)
+true_kw    = (color = :grey60, linewidth = 1.5, linestyle = :dash)
+scatter_kw = (marker = :circle, markersize = 7,
+              color = :white, strokecolor = :black, strokewidth = 1.5)
+
+ldS = lines!(axS, vec(t_train), S_true ./ Y_max[1]; label = "True ODE", true_kw...)
+ldI = lines!(axI, vec(t_train), I_true ./ Y_max[2]; label = "True ODE", true_kw...)
+ldR = lines!(axR, vec(t_train), R_true ./ Y_max[3]; label = "True ODE", true_kw...)
+
+lS  = lines!(axS, tvec, sŷ[1, :]; label = "NN(t, θ_u)", line_kw...)
+lI  = lines!(axI, tvec, sŷ[2, :]; label = "NN(t, θ_u)", line_kw...)
+lR  = lines!(axR, tvec, sŷ[3, :]; label = "NN(t, θ_u)", line_kw...)
+
+sS  = scatter!(axS, vec(t_train), Y_train[1, :]; label = "Data", scatter_kw...)
+sI  = scatter!(axI, vec(t_train), Y_train[2, :]; label = "Data", scatter_kw...)
+sR  = scatter!(axR, vec(t_train), Y_train[3, :]; label = "Data", scatter_kw...)
+
+Legend(fig[0, 1], [ldS, lS, sS],
+       ["True ODE", "NN(t, θ_u)", "Data"],
+       orientation = :horizontal, tellwidth = false)
+
+display(fig)
+
+# save(joinpath(pwd(), "Results", "SIR_SA_NN_fit.pdf"), fig, px_per_unit = 600/72)
+#+end_src
+
+#+RESULTS:
+
+** g-function recovery
+
+#+begin_src julia-vterm
+gmodel = g_model(res.params, res.ctx2)
+gŷ     = gmodel(t_plot)   # (2, 200)
+
+g1_true = -1.5f0 .* S_true .* I_true ./ Y_max[1]
+g2_true =  1.0f0 .* I_true ./ Y_max[3]
+
+fig = CairoMakie.Figure(size = (900, 350), fontsize = 14)
+
+axis_kwargs = (
+    xlabel = "Time",
+    ylabel = "Rate",
+    xgridvisible = true,  ygridvisible = true,
+    topspinevisible = false, rightspinevisible = false,
+    xticklabelsize = 10,  yticklabelsize = 10,
+    titlesize = 14,       titlealign = :left,
+)
+
+axgS = CairoMakie.Axis(fig[1, 1]; title = "g_S(t, θ_g)", axis_kwargs...)
+axgR = CairoMakie.Axis(fig[1, 2]; title = "g_R(t, θ_g)", axis_kwargs...)
+
+Makie.linkxaxes!(axgS, axgR)
+
+trained_kw = (color = :black, linewidth = 2)
+true_kw    = (color = :gray,  linestyle = :dash, linewidth = 2)
+
+lS_fit  = CairoMakie.lines!(axgS, tvec,          gŷ[1, :];    label = "g trained", trained_kw...)
+lS_true = CairoMakie.lines!(axgS, vec(t_train),  g1_true;     label = "g true",    true_kw...)
+lR_fit  = CairoMakie.lines!(axgR, tvec,          gŷ[2, :];    label = "g trained", trained_kw...)
+lR_true = CairoMakie.lines!(axgR, vec(t_train),  g2_true;     label = "g true",    true_kw...)
+
+CairoMakie.Legend(fig[2, 1:2], [lS_fit, lS_true],
+                  ["g trained", "g true"],
+                  orientation = :horizontal, tellwidth = false)
+
+display(fig)
+
+# save(joinpath(pwd(), "Results", "SIR_SA_g_visualization.pdf"), fig, px_per_unit = 600/72)
+#+end_src
+
+#+RESULTS:
+
+** ε evolution and loss diagnostics
+
+These are the static counterparts of rows 3–4 of the live callback figure.
+They are useful for saving to PDF after training completes.
+
+#+begin_src julia-vterm
+stage1_end = 50_000   # matches maxiters_stage1 above
+
+fig = Figure(size = (1100, 700), fontsize = 12)
+
+# --- Row 1: scalar loss curves ---
+metric_labels = ["Data MSE", "ODE MSE", "g std"]
+metrics_data  = [data_mse_hist, ode_mse_hist, g_std_hist]
+metric_colors = [:royalblue, :firebrick, :forestgreen]
+
+for (midx, (label, vals, col)) in enumerate(zip(metric_labels, metrics_data, metric_colors))
+    ax = Makie.Axis(
+        fig[1, midx];
+        title        = label,
+        xlabel       = "Iteration",
+        ylabel       = midx == 1 ? "Loss" : "",
+        yscale       = Makie.log10,
+        xgridvisible = true, ygridvisible = true,
+        topspinevisible = false, rightspinevisible = false,
+        xticklabelsize = 9, yticklabelsize = 9,
+        titlesize = 12, titlealign = :left,
+    )
+    vlines!(ax, [stage1_end]; color = :grey50, linestyle = :dash, linewidth = 1)
+    mask = .!isnan.(vals)
+    lines!(ax, iter_hist[mask], vals[mask]; color = col, linewidth = 1.5)
+end
+
+# --- Row 2: ε evolution ---
+ax_eps = Makie.Axis(
+    fig[2, 1:3];
+    title        = "Self-adaptive ε weights",
+    xlabel       = "Iteration",
+    ylabel       = "ε (absolute value)",
+    yscale       = Makie.log10,
+    xgridvisible = true, ygridvisible = true,
+    topspinevisible = false, rightspinevisible = false,
+    xticklabelsize = 9, yticklabelsize = 9,
+    titlesize = 12, titlealign = :left,
+)
+vlines!(ax_eps, [stage1_end]; color = :grey50, linestyle = :dash, linewidth = 1)
+
+n = length(eps_ic_hist)   # all four ε vectors have the same length
+lines!(ax_eps, iter_hist[1:n], eps_ic_hist;   label = "ε_ic",   color = :royalblue,   linewidth = 1.5)
+lines!(ax_eps, iter_hist[1:n], eps_data_hist; label = "ε_Data", color = :firebrick,   linewidth = 1.5)
+lines!(ax_eps, iter_hist[1:n], eps_ode_hist;  label = "ε_ode",  color = :forestgreen, linewidth = 1.5)
+lines!(ax_eps, iter_hist[1:n], eps_L1_hist;   label = "ε_L1",   color = :darkorange,  linewidth = 1.5)
+axislegend(ax_eps; position = :rt, labelsize = 9)
+
+display(fig)
+
+# save(joinpath(pwd(), "Results", "SIR_SA_diagnostics.pdf"), fig, px_per_unit = 600/72)
+#+end_src
+
+#+RESULTS:
+
+* Symbolic regression on the recovered g-functions
+
+#+begin_src julia-vterm
+using SymbolicRegression
+
+ps  = res.params
+ctx = res.ctx2
+
+smodel = state_model(ps, ctx)
+gmodel = g_model(ps, ctx)
+
+t_dense_sr = ctx.t_dense
+Ỹ = smodel(t_dense_sr)   # 3×B normalised states
+G̃ = gmodel(t_dense_sr)   # 2×B learned g_S, g_R
+
+# Feature matrix: rows are the three normalised state variables
+X = Float64.(Array(Ỹ))   # 3×B
+#+end_src
+
+#+RESULTS:
+
+#+begin_src julia-vterm
+opts = SymbolicRegression.Options(
+    binary_operators = [+, -, *],
+    unary_operators  = [],
+    npopulations     = 30,
+    maxsize          = 20,
+)
+
+println("=== Searching for g_S  (expected: ∝ -S̃·Ĩ) ===")
+hof_gS = SymbolicRegression.EquationSearch(
+    X, Float64.(vec(G̃[1, :]));
+    niterations    = 200,
+    options        = opts,
+    progress       = false,
+    variable_names = ["S_norm", "I_norm", "R_norm"],
+)
+pareto_gS = SymbolicRegression.calculate_pareto_frontier(hof_gS)
+println("g_S Pareto front ($(length(pareto_gS)) expressions):")
+for m in pareto_gS
+    println("  complexity=$(m.complexity)  loss=$(round(m.loss; sigdigits=4))  $(m.tree)")
+end
+#+end_src
+
+#+RESULTS:
+
+#+begin_src julia-vterm
+println("=== Searching for g_R  (expected: ∝ Ĩ) ===")
+hof_gR = SymbolicRegression.EquationSearch(
+    X, Float64.(vec(G̃[2, :]));
+    niterations    = 200,
+    options        = opts,
+    progress       = false,
+    variable_names = ["S_norm", "I_norm", "R_norm"],
+)
+pareto_gR = SymbolicRegression.calculate_pareto_frontier(hof_gR)
+println("g_R Pareto front ($(length(pareto_gR)) expressions):")
+for m in pareto_gR
+    println("  complexity=$(m.complexity)  loss=$(round(m.loss; sigdigits=4))  $(m.tree)")
+end
+#+end_src
+
+#+RESULTS:
