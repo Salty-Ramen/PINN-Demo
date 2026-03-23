@@ -50,7 +50,6 @@ end
 #+end_src
 
 #+RESULTS:
-: Executing... dc68c4b8
 
 To create the toy dataset, we use the following model equations for and SIR
 model:
@@ -301,47 +300,47 @@ has the following governing equations:
 \end{subequations}
 
 
-We create a function ~SIRarchitecturenorm~ which takes in ~y~ and ~g~, of an
-~AbstractMatrix{<:Real}~ datatype, along with ~p~, which should be an ~SIRParams~
-struct object. This function takes y and g to calculate the $\frac{dy}{dt}$ matrix.
+We create a raw-state RHS function ~SIRArchitectureRaw~ which takes in ~y~ and
+~g~, of an ~AbstractMatrix{<:Real}~ datatype, along with ~p~, which should be
+an ~SIRParams~ struct object. The state transform wrapper from ~Transforms.jl~
+then maps this raw RHS into the normalized space used by the network and the
+loss functions.
 
 #+begin_src julia-vterm
 
-# Physics parameters in normalized coordinates (I-equation):
-#   dĨ/dt = β * Ŝ - γ * Ĩ
+# Physics params in the raw I-equation
 struct SIRParams{T<:AbstractFloat}
-    β::T   # infection rate in normalized I-equation
-    γ::T   # recovery rate  in normalized I-equation
+    β::T   # infection rate in I-equation
+    γ::T   # recovery rate  in I-equation
 end
 
 SIRParams(nt::ComponentVector) = SIRParams(
     nt.β, nt.γ
 )
 
-function SIRArchitectureNorm(
-    ỹ::AbstractMatrix{<:Real},   # 3×B (S̃, Ĩ, R̃)
-    g̃::AbstractMatrix{<:Real},   # 2×B (g_S, g_R)
+function SIRArchitecture(
+    y::AbstractMatrix{<:Real},   # 3×B (S, I, R)
+    g::AbstractMatrix{<:Real},   # 2×B (g_S, g_R)
     p::SIRParams,
 )
-    @assert size(ỹ, 1) == 3 "ỹ must have 3 states (Ŝ, Ĩ, R̃)"
-    @assert size(g̃, 1) == 2 "g̃ must have 2 outputs (g_S, g_R)"
-
-    S̃ = ỹ[1, :]   
-    Ĩ = ỹ[2, :]
-    # R̃ = ỹ[3, :]   
-    g_S = g̃[1, :]
-    g_R = g̃[2, :]
+    @assert size(y, 1) == 3 "ỹ must have 3 states (S, I, R)"
+    @assert size(g, 1) == 2 "g̃ must have 2 outputs (g_S, g_R)"
+    
+    S = y[1, :]
+    I = y[2, :]
+    g_S = g[1, :]
+    g_R = g[2, :]
     
 
     # Unknown physics in S and R equations:
-    dS̃ = g_S
+    dS = g_S
 
-    dĨ = p.β .* S̃ .* Ĩ .- p.γ .* Ĩ
+    dI = p.β .* S .* I .- p.γ .* I
 
-    dR̃ = g_R
+    dR = g_R
 
-    # Return as 3×B to match the rest of your pipeline
-    return permutedims(hcat(dS̃, dĨ, dR̃))
+    # Return as 3×B
+    return permutedims(hcat(dS, dI, dR))
 end
 
 #+end_src
@@ -383,8 +382,16 @@ aggregate the non-optimized parameters along with data into a ~tuple~.
 
 #+begin_src julia-vterm
 
-# IC in normalized units
-y0_init = Float32.([3, 0.001, 0.0])./Y_max
+# IC in raw units
+y0_init_raw = Float32.([3, 0.001, 0.0])
+
+# Min max scaling using the inbuilt ZScoreTransform
+state_transform = ZScoreTransform(
+    # Mean 0 for all states
+    zeros(Float32, size(Y_train_actual, 1)),
+    # using max here
+    vec(Y_max)
+)
 
 # Dense time grid and span
 t_dense = permutedims(Float32.(range(
@@ -392,20 +399,19 @@ t_dense = permutedims(Float32.(range(
 )))
 t_span = Float32[minimum(t_train), maximum(t_train)]
 
-# Initial guesses for normalized parameters β_norm, γ
+# Initial guesses for raw parameters β_norm, γ
 guess_SIRparams = SIRParams(1.0f0, 1.0f0)  # choose something reasonable
 
-# Bounds for β, γ (in normalized units)
+# Bounds for β, γ (in raw units)
 β_bounds = Float32[0f0, 10f0]
 γ_bounds = Float32[0f0, 10f0]
 
 data = (
     t_train       = t_train,
-    Y_train       = Y_train,
-    Y_train_std   = permutedims([1,1,1]'),
+    Y_train       = Y_train_actual,
     t_dense       = t_dense,
     t_span        = t_span,
-    y0_init       = y0_init,
+    y0_init       = y0_init_raw,
     ODE_par_init  = (
         β = guess_SIRparams.β,
         γ = guess_SIRparams.γ,
@@ -475,7 +481,7 @@ function callback_fixed(state, l, Architecture::Function, ODE_params; plot_every
 
         # data times (for scatter) – always from training data
         t_data = vec(ctx.t_train)
-        Y      = ctx.Y_train
+        Y      = inverse_state(ctx.transform, ctx.Y_train)
 
         # prediction times (for trajectories)
         if ctx isa PINNCtxStage1
@@ -488,7 +494,7 @@ function callback_fixed(state, l, Architecture::Function, ODE_params; plot_every
         else
             t_plot     = ctx.t_dense                 # 1×Nd
             t_plot_vec = vec(t_plot)                 # Nd
-            y_pred     = smodel(t_plot)             # 3×Nd
+            y_pred     = inverse_state(ctx.transform, smodel(t_plot)) # 3xNd
         end
 
         # store trajectory
@@ -532,7 +538,7 @@ end
 
 
 
-callback_fixed_closure = (state, l) -> callback_fixed(state, l, SIRArchitectureNorm, SIRParams)
+callback_fixed_closure = (state, l) -> callback_fixed(state, l, SIRArchitecture, SIRParams)
 # callback_closure = (state, l) -> callback(state, l, LiparuloArchitecture, LiparuloKnownParams)
 
 #+end_src
@@ -567,6 +573,7 @@ hp = HyperParams(
     1.0/10.0f0,
     1/25.0f0,
     1/√(750f-3),
+    1/√(750f-3),
 )
 data_mse_hist = Float32[]
 ode_mse_hist  = Float32[]
@@ -577,9 +584,10 @@ iter_counter  = Ref(0)
 
 stats = @timed res = train_fixed_hyper(
     data,
-    SIRArchitectureNorm,
+    SIRArchitecture,
     SIRParams,
     hp;
+    transform = state_transform,
     user_loss_functions = Function[],
     maxiters_stage1     = 50_000,
     maxiters_stage2     = 120_000,
@@ -609,7 +617,8 @@ t_plot = Float32.(collect(range(first(t_span), last(t_span), length = 200)))
 t_plot = permutedims(t_plot)            # (1, N)
 tvec   = vec(t_plot)                    # (N,)
 
-sŷ = smodel(t_plot)                    # size ≈ (3, length(tvec))
+sŷ = smodel(t_plot)
+# sŷ = inverse_state(res.ctx2.transform, smodel(t_plot))                    # size ≈ (3, length(tvec))
 
 # --- Figure + theme ---
 fig = Figure(size = (800, 600), fontsize = 14)
@@ -674,7 +683,6 @@ display(fig)
 #+end_src
 
 #+RESULTS:
-: Executing... ddfe93e8
 
 The fit $\mathrm{g}$ for each state is overlayed on ground truth.
 
