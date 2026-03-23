@@ -18,20 +18,21 @@ struct HyperParams
     ϵ_L1_g      :: Float32
 end
 
-struct PINNCtxStage1{M,ST,T,Y,YS,V}
+struct PINNCtxStage1{M,ST,T,Y,YS,V,TR}
     State_MLP   :: M
     st_StateMLP :: ST
     t_train     :: T
     Y_train     :: Y
     Y_train_std :: YS
     y0_obs      :: V
+    transform   :: TR
     ϵ_ic        :: Float32
     ϵ_Data      :: Float32
     ϵ_L1_state  :: Float32
     t_span      :: Vector{Float32}
 end
 
-struct PINNCtxStage2{M,ST,GM,STG,T,Y,YS,V,TD}
+struct PINNCtxStage2{M,ST,GM,STG,T,Y,YS,V,TD,TR}
     State_MLP      :: M
     st_StateMLP    :: ST
     g_MLP          :: GM
@@ -40,6 +41,7 @@ struct PINNCtxStage2{M,ST,GM,STG,T,Y,YS,V,TD}
     Y_train        :: Y
     Y_train_std    :: YS
     y0_obs         :: V
+    transform      :: TR
     ϵ_ic           :: Float32
     ϵ_Data         :: Float32
     ϵ_ode          :: Float32
@@ -51,6 +53,7 @@ struct PINNCtxStage2{M,ST,GM,STG,T,Y,YS,V,TD}
 end
 
 include("Losses.jl")
+include("Transforms.jl")
  
 struct TrainResult{PS,CTX,M1,M2}
     hyper    :: HyperParams
@@ -79,7 +82,8 @@ function metrics_stage2(ps, ctx::PINNCtxStage2, architecture::Function, ODE_para
     ODE_par = ODE_params(ps.ODE_par)
     Tdense  = ctx.t_dense
     dNNdt   = dNNdt_fd(smodel, vec(Tdense))
-    f_ŷ     = architecture(smodel(Tdense), gmodel(Tdense), ODE_par)
+    ẑ       = smodel(Tdense) 
+    f_ŷ     = transformed_rhs(ctx.transform, ẑ, gmodel(Tdense), ODE_par, architecture)
     ode_mse = MSE(dNNdt, f_ŷ, std(dNNdt; dims = 2))
 
     g_out   = gmodel(Tdense)
@@ -132,15 +136,34 @@ function initialize_components(rng, data, hp::HyperParams, build_state_mlp::Func
     return State_MLP, st_StateMLP, g_MLP, st_gMLP, trainable_params
 end
 
-function build_contexts(State_MLP, st_StateMLP, g_MLP, st_gMLP, data, hp::HyperParams)
+# Checks the data tuple for raw data/IC and returns accordingly
+raw_training_targets(data) = hasproperty(data, :Y_train_raw) ? data.Y_train_raw : data.Y_train
+raw_initial_state(data) = hasproperty(data, :y0_init_raw) ? data.y0_init_raw : data.y0_init
+
+target_scale(Y_train) = max.(std(Y_train; dims = 2), 1f-6)
+
+function build_contexts(State_MLP, st_StateMLP, g_MLP, st_gMLP, data, hp::HyperParams;
+                        transform::AbstractStateTransform = IdentityTransform())
+
+    # Transform the training targets (raw data)
+    Y_train_raw = raw_training_targets(data)
+    y0_raw = raw_initial_state(data)
+
+    Y_train = forward_state(transform, Y_train_raw)
+    y0_obs = forward_state(transform, y0_raw)
+    Y_train_std = target_scale(Y_train)
+
+    
+    
     # Context for Stage 1 (Supervised/Data-fitting)
     ctx_stage1 = PINNCtxStage1(
         State_MLP,
         st_StateMLP,
         data.t_train,
-        data.Y_train,
-        data.Y_train_std,
-        data.y0_init,
+        Y_train,
+        Y_train_std,
+        y0_obs,
+        transform,
         hp.ϵ_ic,
         hp.ϵ_Data,
         hp.ϵ_L1_state,
@@ -154,9 +177,10 @@ function build_contexts(State_MLP, st_StateMLP, g_MLP, st_gMLP, data, hp::HyperP
         g_MLP,
         st_gMLP,
         data.t_train,
-        data.Y_train,
-        data.Y_train_std,
-        data.y0_init,
+        Y_train,
+        Y_train_std,
+        y0_obs,
+        transform,
         hp.ϵ_ic,
         hp.ϵ_Data,
         hp.ϵ_ode,
@@ -232,6 +256,7 @@ function train_once(
     architecture::Function,
     ode_param_constructor,
     hp::HyperParams= HyperParams(1f0, 1f0, 1f0, 1f0, 1f0);
+    transform::AbstractStateTransform = IdentityTransform(),
     user_loss_functions::AbstractVector{<:Function} = Function[], 
     seed::Integer = 1,
     maxiters_stage1::Integer = 10_000,
@@ -254,7 +279,7 @@ function train_once(
 
     # 2. Context Building
     ctx_stage1, ctx_stage2 = build_contexts(
-        State_MLP, st_StateMLP, g_MLP, st_gMLP, data, hp
+        State_MLP, st_StateMLP, g_MLP, st_gMLP, data, hp; transform = transform
     )
     
     # 3. Stage 1: Supervised Training
@@ -318,6 +343,7 @@ function train_fixed_hyper(
     architecture::Function,
     ode_param_constructor,
     hp::HyperParams= HyperParams(1f0, 1f0, 1f0, 1);
+    transform::AbstractStateTransform = IdentityTransform(),
     user_loss_functions::AbstractVector{<:Function} = Function[], 
     seed::Integer = 1,
     maxiters_stage1::Integer = 10_000,
@@ -341,7 +367,7 @@ function train_fixed_hyper(
 
     # 2. Context Building (Standard, as it populates ctx with hp values)
     ctx_stage1, ctx_stage2 = build_contexts(
-        State_MLP, st_StateMLP, g_MLP, st_gMLP, data, hp
+        State_MLP, st_StateMLP, g_MLP, st_gMLP, data, hp; transform = transform
     )
     
     # 3. Stage 1: Supervised Training
@@ -385,7 +411,6 @@ end
 
 
 
-
 #--------Training Function--------
 """
 Run the two-stage training for given `hp::HyperParams` and `data` NamedTuple.
@@ -405,6 +430,7 @@ function train_once_legacy(
     architecture::Function,
     ode_param_constructor,
     hp::HyperParams= HyperParams(1f0, 1f0, 1f0, 1);
+    transform = IdentityTransform(),
     user_loss_functions::AbstractVector{<:Function} = Function[], 
     seed::Integer = 1,
     maxiters_stage1::Integer  = 10_000,
@@ -439,38 +465,10 @@ function train_once_legacy(
         )
     )
 
-    # Build contexts
-    ctx_stage1 = PINNCtxStage1(
-        State_MLP,
-        st_StateMLP,
-        data.t_train,
-        data.Y_train,
-        data.Y_train_std,
-        data.y0_init,
-         hp.ϵ_ic,
-         hp.ϵ_ode,
-         hp.ϵ_Data,
-         hp.ϵ_L1,
-        data.t_span,
+    ctx_stage1, ctx_stage2 = build_contexts(
+        State_MLP, st_StateMLP, g_MLP, st_gMLP, data, hp; transform = transform
     )
 
-    ctx_stage2 = PINNCtxStage2(
-        State_MLP,
-        st_StateMLP,
-        g_MLP,
-        st_gMLP,
-        data.t_train,
-        data.Y_train,
-        data.Y_train_std,
-        data.y0_init,
-         hp.ϵ_ic,
-         hp.ϵ_ode,
-         hp.ϵ_Data,
-         hp.ϵ_L1,
-        data.t_dense,
-        data.t_span,
-        data.ODE_par_bounds,
-    )
 
     # Small helper for OptimizationFunction
     make_optfun(loss) = Optimization.OptimizationFunction(
@@ -531,4 +529,3 @@ function train_once_legacy(
         hp, ps_trained, ctx_stage2, State_MLP, g_MLP, metrics
     )
 end
-
