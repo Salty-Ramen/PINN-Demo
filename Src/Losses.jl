@@ -71,10 +71,11 @@ end
 
 function loss_IC(ps, ctx)
     smodel = state_model(ps, ctx)
-    tspan = ctx.t_span
+    # tspan = ctx.t_span
     init_obs = ctx.y0_obs
+    denom = max.(abs.(init_obs), 1f-6)
     # This needs to change. Currently is an arbitrary value
-    IC_MSE = MSE(smodel([0f0]'), init_obs, std(init_obs))
+    IC_MSE = MSE(smodel([0f0]'), init_obs, denom)
     return IC_MSE
 end
 
