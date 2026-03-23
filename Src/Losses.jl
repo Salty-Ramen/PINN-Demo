@@ -28,13 +28,19 @@ function dNNdt_fd(smodel, tvec::AbstractVector; h::Real = 1f-3)
     return dYdt
 end
 
-# Simple L1 penalty on network parameters
-function l1_penalty(ps)
+# L1 penalty is now network specific to have finer control of the optimization
+function l1_mean(x)
+    return sum(abs, x) / length(x)
+end
+
+function l1_penalty_state(ps)
     ws = ComponentArrays.getdata(ps.StateMLP)
+    return l1_mean(ws)
+end
+
+function l1_penalty_g(ps)
     wg = ComponentArrays.getdata(ps.gMLP)
-    ls = length(ComponentArrays.getdata(ps.StateMLP))
-    lg = length(ComponentArrays.getdata(ps.gMLP))
-    return sum(abs, ws)/ls + sum(abs, wg)/lg
+    return l1_mean(wg)
 end
 
 function param_bound_penalty(ps, ctx::PINNCtxStage2)
@@ -95,17 +101,18 @@ function self_adaptive_supervised_loss(ps, ctx::PINNCtxStage1)
 
     hyperparams = ps.hyper
    
-    ϵ_ic_sq   = exp(2f0 * hyperparams.log_ϵ_ic)   + 1f-6
-    ϵ_Data_sq = exp(2f0 * hyperparams.log_ϵ_Data) + 1f-6
-    ϵ_L1_sq   = exp(2f0 * hyperparams.log_ϵ_L1)   + 1f-6
+    ϵ_ic_sq        = exp(2f0 * hyperparams.log_ϵ_ic)       + 1f-6
+    ϵ_Data_sq      = exp(2f0 * hyperparams.log_ϵ_Data)     + 1f-6
+    ϵ_L1_state_sq  = exp(2f0 * hyperparams.log_ϵ_L1_state) + 1f-6
 
     hyper_loss = 2f0 * hyperparams.log_ϵ_ic +
-        2f0 * hyperparams.log_ϵ_Data
+        2f0 * hyperparams.log_ϵ_Data +
+        2f0 * hyperparams.log_ϵ_L1_state
 
     return 0.5 * (
         loss_IC(ps, ctx) / ϵ_ic_sq +
         loss_Data(ps, ctx) / ϵ_Data_sq +
-      #  l1_penalty(ps) / ϵ_L1_sq + 
+        l1_penalty_state(ps) / ϵ_L1_state_sq + 
         hyper_loss
     )
 end
@@ -117,64 +124,64 @@ function self_adaptive_unsupervised_loss(ps, ctx::PINNCtxStage2,
 
     hyperparams = ps.hyper
     
-    ϵ_ic_sq   = exp(2f0 * hyperparams.log_ϵ_ic)   + 1f-6
-    ϵ_Data_sq = exp(2f0 * hyperparams.log_ϵ_Data) + 1f-6
-    ϵ_ode_sq  = exp(2f0 * hyperparams.log_ϵ_ode)  + 1f-6
-    ϵ_L1_sq   = exp(2f0 * hyperparams.log_ϵ_L1)   + 1f-6
+    ϵ_ic_sq       = exp(2f0 * hyperparams.log_ϵ_ic)       + 1f-6
+    ϵ_Data_sq     = exp(2f0 * hyperparams.log_ϵ_Data)     + 1f-6
+    ϵ_ode_sq      = exp(2f0 * hyperparams.log_ϵ_ode)      + 1f-6
+    ϵ_L1_state_sq = exp(2f0 * hyperparams.log_ϵ_L1_state) + 1f-6
+    ϵ_L1_g_sq     = exp(2f0 * hyperparams.log_ϵ_L1_g)     + 1f-6
 
     hyper_loss = 2f0 * hyperparams.log_ϵ_ic +
         2f0 * hyperparams.log_ϵ_Data +
         2f0 * hyperparams.log_ϵ_ode +
-        2f0 * hyperparams.log_ϵ_L1
+        2f0 * hyperparams.log_ϵ_L1_state +
+        2f0 * hyperparams.log_ϵ_L1_g
     
     return 0.5 * (
         loss_IC(ps, ctx) / ϵ_ic_sq +
         loss_Data(ps, ctx) / ϵ_Data_sq +
         loss_ODE(ps, ctx, architecture, ODE_param_constructor) / ϵ_ode_sq +
-        l1_penalty(ps) / ϵ_L1_sq +
+        l1_penalty_state(ps) / ϵ_L1_state_sq +
+        l1_penalty_g(ps) / ϵ_L1_g_sq +
         hyper_loss +
         param_bound_penalty(ps, ctx)
     )
 end
 
-
 function fixed_supervised_loss(ps, ctx::PINNCtxStage1)
-    # Extract fixed tolerances from context
-    ϵ_ic_sq   = ctx.ϵ_ic^2 + 1f-6
-    ϵ_Data_sq = ctx.ϵ_Data^2 + 1f-6
-    ϵ_L1_sq   = ctx.ϵ_L1^2 + 1f-6 
+    ϵ_ic_sq       = ctx.ϵ_ic^2 + 1f-6
+    ϵ_Data_sq     = ctx.ϵ_Data^2 + 1f-6
+    ϵ_L1_state_sq = ctx.ϵ_L1_state^2 + 1f-6
 
-    return 0.5 * (
+    return 0.5f0 * (
         loss_IC(ps, ctx) / ϵ_ic_sq +
-        loss_Data(ps, ctx) / ϵ_Data_sq 
-        #+ l1_penalty(ps) / ϵ_L1_sq  # Uncomment if L1 is desired in Stage 1
+        loss_Data(ps, ctx) / ϵ_Data_sq +
+        l1_penalty_state(ps) / ϵ_L1_state_sq
     )
 end
 
 function fixed_unsupervised_loss(ps, ctx::PINNCtxStage2,
                                  architecture::Function,
-                                 ODE_param_constructor
-                                 )
+                                 ODE_param_constructor)
 
-    # Extract fixed tolerances from context
-    ϵ_ic_sq   = ctx.ϵ_ic^2 + 1f-6
-    ϵ_Data_sq = ctx.ϵ_Data^2 + 1f-6
-    ϵ_ode_sq  = ctx.ϵ_ode^2 + 1f-6
-    ϵ_L1_sq   = ctx.ϵ_L1^2 + 1f-6
+    ϵ_ic_sq       = ctx.ϵ_ic^2 + 1f-6
+    ϵ_Data_sq     = ctx.ϵ_Data^2 + 1f-6
+    ϵ_ode_sq      = ctx.ϵ_ode^2 + 1f-6
+    ϵ_L1_state_sq = ctx.ϵ_L1_state^2 + 1f-6
+    ϵ_L1_g_sq     = ctx.ϵ_L1_g^2 + 1f-6
 
-    # Calculate individual loss components
-    L_ic   = loss_IC(ps, ctx)
-    L_data = loss_Data(ps, ctx)
-    L_ode  = loss_ODE(ps, ctx, architecture, ODE_param_constructor)
-    L_L1   = l1_penalty(ps)
-    L_bnd  = param_bound_penalty(ps, ctx)
+    L_ic      = loss_IC(ps, ctx)
+    L_data    = loss_Data(ps, ctx)
+    L_ode     = loss_ODE(ps, ctx, architecture, ODE_param_constructor)
+    L_L1s     = l1_penalty_state(ps)
+    L_L1g     = l1_penalty_g(ps)
+    L_bnd     = param_bound_penalty(ps, ctx)
 
-    # Weighted Sum
-    return 0.5 * (
-        L_ic / ϵ_ic_sq +
+    return 0.5f0 * (
+        L_ic   / ϵ_ic_sq +
         L_data / ϵ_Data_sq +
-        L_ode / ϵ_ode_sq +
-        L_L1 / ϵ_L1_sq +
-        L_bnd # Bound penalty is usually hard-constrained or scaled internally
+        L_ode  / ϵ_ode_sq +
+        L_L1s  / ϵ_L1_state_sq +
+        L_L1g  / ϵ_L1_g_sq +
+        L_bnd
     )
 end
