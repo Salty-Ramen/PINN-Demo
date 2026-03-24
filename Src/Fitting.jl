@@ -251,6 +251,25 @@ function run_stage2(
     return res2.u
 end
 
+function extract_learned_hyper(ps) 
+    if hasproperty(ps, :hyper)
+        h = ps.hyper
+        # Parameters were stored as log(ε) to keep them unconstrained;
+        # exp() recovers the positive ε values the loss functions see.
+        return HyperParams(
+            exp(h.log_ϵ_ic),
+            exp(h.log_ϵ_ode),
+            exp(h.log_ϵ_Data),
+            exp(h.log_ϵ_L1_state),
+            exp(h.log_ϵ_L1_g),
+        )
+    else
+        # Fixed-hyperparameter training: no learned ε to report.
+        nan = NaN32
+        return HyperParams(nan, nan, nan, nan, nan)
+    end
+end
+
 function train_once(
     data,
     architecture::Function,
@@ -310,8 +329,10 @@ function train_once(
     d_mse, o_mse, g_s = metrics_stage2(ps_trained, ctx_stage2, architecture, ode_param_constructor)
     metrics = (data_mse = d_mse, ode_mse = o_mse, g_std = g_s)
 
+    hyper_final = extract_learned_hyper(ps_trained)
+
     return TrainResult{typeof(ps_trained), typeof(ctx_stage2), typeof(State_MLP), typeof(g_MLP)}(
-        hp, ps_trained, ctx_stage2, State_MLP, g_MLP, metrics
+        hyper_final, ps_trained, ctx_stage2, State_MLP, g_MLP, metrics
     )
 end
 
@@ -399,8 +420,10 @@ function train_fixed_hyper(
     o_mse = loss_ODE(ps_trained, ctx_stage2, architecture, ode_param_constructor)
     metrics = (data_mse = d_mse, ode_mse = o_mse)
 
+    hyper_final = extract_learned_hyper(ps_trained)
+
     return TrainResult{typeof(ps_trained), typeof(ctx_stage2), typeof(State_MLP), typeof(g_MLP)}(
-        hp, ps_trained, ctx_stage2, State_MLP, g_MLP, metrics
+        hyper_final, ps_trained, ctx_stage2, State_MLP, g_MLP, metrics
     )
 end
 
