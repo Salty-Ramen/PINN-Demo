@@ -116,7 +116,7 @@ SIRParams(nt::ComponentVector) = SIRParams(nt.β, nt.γ)
 
 #+RESULTS:
 
-* Reading and normalising the training dataset
+* Reading the training dataset and defining the transform
 
 #+begin_src julia-vterm
 df = CSV.read(
@@ -133,9 +133,9 @@ Y_train_actual = permutedims(Matrix{Float32}(df[:, [:S, :I, :R]]))
 
 t_train = permutedims(Matrix{Float32}(df[:, [:t]]))
 
-# Normalise by per-state maximum so every state lives in [0, 1]
-Y_max   = maximum(Y_train_actual; dims = 2)
-Y_train = Y_train_actual ./ Y_max
+# Use the shared Transforms.jl interface: z = y ./ Y_max (a scale-only affine map)
+Y_max = maximum(Y_train_actual; dims = 2)
+state_transform = ZScoreTransform(zeros(Float32, 3), vec(Y_max))
 #+end_src
 
 #+RESULTS:
@@ -155,24 +155,24 @@ equations are fully unknown, the I equation retains known physics.
 \end{subequations}
 
 #+begin_src julia-vterm
-function SIRArchitectureNorm(
-    ỹ::AbstractMatrix{<:Real},   # 3×B normalised (S̃, Ĩ, R̃)
-    g̃::AbstractMatrix{<:Real},   # 2×B learned    (g_S, g_R)
+function SIRArchitectureRaw(
+    y::AbstractMatrix{<:Real},   # 3×B raw (S, I, R)
+    g::AbstractMatrix{<:Real},   # 2×B learned raw rates (g_S, g_R)
     p::SIRParams,
 )
-    @assert size(ỹ, 1) == 3 "ỹ must have 3 states (S̃, Ĩ, R̃)"
-    @assert size(g̃, 1) == 2 "g̃ must have 2 outputs (g_S, g_R)"
+    @assert size(y, 1) == 3 "y must have 3 states (S, I, R)"
+    @assert size(g, 1) == 2 "g must have 2 outputs (g_S, g_R)"
 
-    S̃   = ỹ[1, :]
-    Ĩ   = ỹ[2, :]
-    g_S = g̃[1, :]
-    g_R = g̃[2, :]
+    S = y[1, :]
+    I = y[2, :]
+    g_S = g[1, :]
+    g_R = g[2, :]
 
-    dS̃ = g_S
-    dĨ  = p.β .* S̃ .* Ĩ .- p.γ .* Ĩ
-    dR̃ = g_R
+    dS = g_S
+    dI = p.β .* S .* I .- p.γ .* I
+    dR = g_R
 
-    return permutedims(hcat(dS̃, dĨ, dR̃))
+    return permutedims(hcat(dS, dI, dR))
 end
 #+end_src
 
@@ -202,8 +202,8 @@ build_g_mlp() = Lux.Chain(
 * Aggregating data into a NamedTuple
 
 #+begin_src julia-vterm
-# Initial condition in normalised coordinates
-y0_init = Float32.([3, 0.001, 0.0]) ./ Y_max
+# Initial condition in raw coordinates; transform is applied by train_once
+y0_init_raw = Float32.([3, 0.001, 0.0])
 
 # Dense collocation grid for the ODE residual term
 t_dense = permutedims(Float32.(range(
@@ -220,13 +220,10 @@ guess_SIRparams = SIRParams(1.0f0, 1.0f0)
 
 data = (
     t_train        = t_train,
-    Y_train        = Y_train,
-    # Passing all-ones std so MSE is unweighted across states; swap for the
-    # actual per-state std if scale differences between states are large
-    Y_train_std    = permutedims([1, 1, 1]'),
+    Y_train_raw    = Y_train_actual,
     t_dense        = t_dense,
     t_span         = t_span,
-    y0_init        = y0_init,
+    y0_init_raw    = y0_init_raw,
     ODE_par_init   = (β = guess_SIRparams.β, γ = guess_SIRparams.γ),
     ODE_par_bounds = (β = β_bounds, γ = γ_bounds),
 )
@@ -258,15 +255,16 @@ iter_hist     = Int[]
 eps_ic_hist   = Float32[]
 eps_data_hist = Float32[]
 eps_ode_hist  = Float32[]
-eps_L1_hist   = Float32[]
+eps_L1_state_hist   = Float32[]
+eps_L1_g_hist   = Float32[]
 
 # Trailing trajectory buffer for the state-fit panels (keeps last 10 snapshots)
 trajectory_history = NamedTuple[]
 
 # Ground-truth g values on the training grid (normalised coordinates)
 # Computed once here so the callback doesn't recompute them every iteration
-g1_true_cb = -1.5f0 .* S_true .* I_true ./ Y_max[1]   # g_S true
-g2_true_cb =  1.0f0 .* I_true ./ Y_max[3]              # g_R true
+g1_true_cb = -1.5f0 .* S_true .* I_true   # g_S true (raw coordinates)
+g2_true_cb =  1.0f0 .* I_true             # g_R true (raw coordinates)
 
 # --- Persistent figure: built once, mutated in the callback ---
 global cb_fig = Figure(size = (1100, 900), fontsize = 11)
@@ -330,10 +328,11 @@ function callback_self_adaptive(state, l, Architecture::Function, ODE_params;
     # Guard: ps.hyper always exists in train_once but we protect against edge cases
     try
         h = ps.hyper
-        push!(eps_ic_hist,   abs(h.ϵ_ic))
-        push!(eps_data_hist, abs(h.ϵ_Data))
-        push!(eps_ode_hist,  abs(h.ϵ_ode))
-        push!(eps_L1_hist,   abs(h.ϵ_L1))
+        push!(eps_ic_hist,       h.log_ϵ_ic)
+        push!(eps_data_hist,     h.log_ϵ_Data)
+        push!(eps_ode_hist,      h.log_ϵ_ode)
+        push!(eps_L1_state_hist, h.log_ϵ_L1_state)
+        push!(eps_L1_g_hist,     h.log_ϵ_L1_g)
     catch
     end
 
@@ -434,7 +433,7 @@ end
 
 # Partially apply so the signature matches (state, l) -> Bool
 callback_closure = (state, l) ->
-    callback_self_adaptive(state, l, SIRArchitectureNorm, SIRParams)
+    callback_self_adaptive(state, l, SIRArchitectureRaw, SIRParams)
 #+end_src
 
 #+RESULTS:
@@ -452,10 +451,11 @@ provide.
 
 #+begin_src julia-vterm
 hp = HyperParams(
-    1.0f0,   # ε_ic   — initial IC penalty weight
-    1.0f0,   # ε_ode  — initial ODE residual weight
-    1.0f0,   # ε_Data — initial data fit weight
-    1.0f0,   # ε_L1   — initial L1 regularisation weight
+    1.0f0,   # ε_ic       — initial IC penalty weight
+    1.0f0,   # ε_ode      — initial ODE residual weight
+    1.0f0,   # ε_Data     — initial data fit weight
+    1.0f0,   # ε_L1_state — initial L1 regularisation weight
+    1.0f0,   # ε_L1_g     — initial L1 regularisation weight
 )
 #+end_src
 
@@ -470,7 +470,7 @@ scaled relative to MLP weights (see issue #4 in the Background section).
 #+begin_src julia-vterm
 stats = @timed res = train_once(
     data,
-    SIRArchitectureNorm,
+    SIRArchitectureRaw,
     SIRParams,
     hp;
     user_loss_functions = Function[],
@@ -480,6 +480,7 @@ stats = @timed res = train_once(
     Opt_alg_stage1      = OptimizationOptimisers.Adam(1f-4),
     Opt_alg_stage2      = OptimizationOptimisers.Adam(1f-4),
     callback_function   = callback_closure,
+    transform           = state_transform,
 )
 
 println("Training time : $(round(stats.time; digits = 1)) s")
@@ -548,9 +549,9 @@ lS  = lines!(axS, tvec, sŷ[1, :]; label = "NN(t, θ_u)", line_kw...)
 lI  = lines!(axI, tvec, sŷ[2, :]; label = "NN(t, θ_u)", line_kw...)
 lR  = lines!(axR, tvec, sŷ[3, :]; label = "NN(t, θ_u)", line_kw...)
 
-sS  = scatter!(axS, vec(t_train), Y_train[1, :]; label = "Data", scatter_kw...)
-sI  = scatter!(axI, vec(t_train), Y_train[2, :]; label = "Data", scatter_kw...)
-sR  = scatter!(axR, vec(t_train), Y_train[3, :]; label = "Data", scatter_kw...)
+sS  = scatter!(axS, vec(t_train), res.ctx2.Y_train[1, :]; label = "Data", scatter_kw...)
+sI  = scatter!(axI, vec(t_train), res.ctx2.Y_train[2, :]; label = "Data", scatter_kw...)
+sR  = scatter!(axR, vec(t_train), res.ctx2.Y_train[3, :]; label = "Data", scatter_kw...)
 
 Legend(fig[0, 1], [ldS, lS, sS],
        ["True ODE", "NN(t, θ_u)", "Data"],
@@ -569,8 +570,8 @@ display(fig)
 gmodel = g_model(res.params, res.ctx2)
 gŷ     = gmodel(t_plot)   # (2, 200)
 
-g1_true = -1.5f0 .* S_true .* I_true ./ Y_max[1]
-g2_true =  1.0f0 .* I_true ./ Y_max[3]
+g1_true = -1.5f0 .* S_true .* I_true
+g2_true =  1.0f0 .* I_true
 
 fig = CairoMakie.Figure(size = (900, 350), fontsize = 14)
 
@@ -628,7 +629,7 @@ for (midx, (label, vals, col)) in enumerate(zip(metric_labels, metrics_data, met
         title        = label,
         xlabel       = "Iteration",
         ylabel       = midx == 1 ? "Loss" : "",
-        yscale       = Makie.log10,
+        # yscale       = Makie.log10,
         xgridvisible = true, ygridvisible = true,
         topspinevisible = false, rightspinevisible = false,
         xticklabelsize = 9, yticklabelsize = 9,
@@ -645,7 +646,7 @@ ax_eps = Makie.Axis(
     title        = "Self-adaptive ε weights",
     xlabel       = "Iteration",
     ylabel       = "ε (absolute value)",
-    yscale       = Makie.log10,
+    # yscale       = Makie.log10,
     xgridvisible = true, ygridvisible = true,
     topspinevisible = false, rightspinevisible = false,
     xticklabelsize = 9, yticklabelsize = 9,
@@ -657,7 +658,8 @@ n = length(eps_ic_hist)   # all four ε vectors have the same length
 lines!(ax_eps, iter_hist[1:n], eps_ic_hist;   label = "ε_ic",   color = :royalblue,   linewidth = 1.5)
 lines!(ax_eps, iter_hist[1:n], eps_data_hist; label = "ε_Data", color = :firebrick,   linewidth = 1.5)
 lines!(ax_eps, iter_hist[1:n], eps_ode_hist;  label = "ε_ode",  color = :forestgreen, linewidth = 1.5)
-lines!(ax_eps, iter_hist[1:n], eps_L1_hist;   label = "ε_L1",   color = :darkorange,  linewidth = 1.5)
+lines!(ax_eps, iter_hist[1:n], eps_L1_state_hist;   label = "ε_L1_state",   color = :darkorange,  linewidth = 1.5)
+lines!(ax_eps, iter_hist[1:n], eps_L1_g_hist;   label = "ε_L1_g",   color = :darkorange,  linewidth = 1.5)
 axislegend(ax_eps; position = :rt, labelsize = 9)
 
 display(fig)
