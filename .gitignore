@@ -52,3 +52,4 @@ tramp
 
 *.Rhistory
 .Rproj.user
+*sync-conflict*
