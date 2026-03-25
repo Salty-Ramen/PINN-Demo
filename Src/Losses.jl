@@ -28,6 +28,41 @@ function dNNdt_fd(smodel, tvec::AbstractVector; h::Real = 1f-3)
     return dYdt
 end
 
+"""
+    compute_frozen_ode_scale(ps_stage1, ctx_stage1_or_2; min_scale=1f-6)
+
+Differentiate the Stage 1 state network on the dense collocation grid and
+return a frozen (n_states × 1) normalization scale.
+
+Call this *once* between Stage 1 and Stage 2. The returned matrix is detached
+from the computation graph — it's a plain array constant.
+
+Arguments
+- `ps_stage1`:  parameter vector at the end of Stage 1
+- `ctx_stage1_or_2`: any context that has `.State_MLP`, `.st_StateMLP`,
+                      and `.t_dense` (Stage 2 context works fine)
+- `min_scale`:  floor to prevent degenerate normalization on flat states
+"""
+function compute_frozen_ode_scale(
+    ps_stage1,
+    ctx;
+    min_scale::Float32 = 1f-6,
+)
+    smodel = state_model(ps_stage1, ctx)
+    t_dense_vec = vec(ctx.t_dense)
+
+    # Reuse the existing FD helper — the Stage 1 network is smooth so
+    # the O(h²) error from central differences is negligible here
+    dYdt = dNNdt_fd(smodel, t_dense_vec)
+
+    scale = std(dYdt; dims = 2)
+    scale = max.(scale, min_scale)
+
+    # Detach from any AD tape so this is treated as a constant in Stage 2
+    return Float32.(Array(scale))
+end
+
+
 # L1 penalty is now network specific to have finer control of the optimization
 function l1_mean(x)
     return sum(abs, x) / length(x)
