@@ -128,9 +128,8 @@ function loss_ODE(
     g_arr = gmodel(Tdense)
     dNNdt   = dNNdt_fd(smodel, vec(Tdense))         # 3×B
     f_ŷ     = transformed_rhs(ctx.transform, ẑ, g_arr, ODE_par, architecture)
-    ODE_MSE  = MSE(dNNdt, f_ŷ, std(dNNdt; dims =2))
 
-    return ODE_MSE
+    return  MSE(dNNdt, f_ŷ, ctx.G_stage1_std)
 end
 
 

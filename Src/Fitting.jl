@@ -32,7 +32,7 @@ struct PINNCtxStage1{M,ST,T,Y,YS,V,TR}
     t_span      :: Vector{Float32}
 end
 
-struct PINNCtxStage2{M,ST,GM,STG,T,Y,YS,V,TD,TR}
+struct PINNCtxStage2{M,ST,GM,STG,T,Y,YS,GS,V,TD,TR}
     State_MLP      :: M
     st_StateMLP    :: ST
     g_MLP          :: GM
@@ -40,6 +40,7 @@ struct PINNCtxStage2{M,ST,GM,STG,T,Y,YS,V,TD,TR}
     t_train        :: T
     Y_train        :: Y
     Y_train_std    :: YS
+    G_stage1_std   :: GS
     y0_obs         :: V
     transform      :: TR
     ϵ_ic           :: Float32
@@ -84,7 +85,7 @@ function metrics_stage2(ps, ctx::PINNCtxStage2, architecture::Function, ODE_para
     dNNdt   = dNNdt_fd(smodel, vec(Tdense))
     ẑ       = smodel(Tdense) 
     f_ŷ     = transformed_rhs(ctx.transform, ẑ, gmodel(Tdense), ODE_par, architecture)
-    ode_mse = MSE(dNNdt, f_ŷ, std(dNNdt; dims = 2))
+    ode_mse = MSE(dNNdt, f_ŷ, ctx.G_stage1_std)
 
     g_out   = gmodel(Tdense)
     g_std   = std(vec(g_out))
@@ -179,6 +180,7 @@ function build_contexts(State_MLP, st_StateMLP, g_MLP, st_gMLP, data, hp::HyperP
         data.t_train,
         Y_train,
         Y_train_std,
+        Y_train_std,  # This is purely for initialization, will change before stage 2 starts
         y0_obs,
         transform,
         hp.ϵ_ic,
@@ -270,6 +272,29 @@ function extract_learned_hyper(ps)
     end
 end
 
+function rebuild_ctx_stage2(ctx::PINNCtxStage2, frozen_scale::AbstractMatrix)
+    PINNCtxStage2(
+        ctx.State_MLP,
+        ctx.st_StateMLP,
+        ctx.g_MLP,
+        ctx.st_gMLP,
+        ctx.t_train,
+        ctx.Y_train,
+        ctx.Y_train_std,
+        frozen_scale,       # <-- the only field that changes
+        ctx.y0_obs,
+        ctx.transform,
+        ctx.ϵ_ic,
+        ctx.ϵ_Data,
+        ctx.ϵ_ode,
+        ctx.ϵ_L1_state,
+        ctx.ϵ_L1_g,
+        ctx.t_dense,
+        ctx.t_span,
+        ctx.ODE_par_bounds,
+    )
+end
+
 function train_once(
     data,
     architecture::Function,
@@ -310,6 +335,12 @@ function train_once(
         default_supervised_loss,
         callback_function
     )
+
+    # Freeze the derivative scale from the Stage 1 network
+    frozen_scale = compute_frozen_ode_scale(trainable_params_stage1, ctx_stage2)
+
+    # Rebuild ctx with the correct normalization (structs are immutable)
+    ctx_stage2 = rebuild_ctx_stage2(ctx_stage2, frozen_scale)
 
     # 4. Stage 2: ODE-regularized Training
     ps_trained = run_stage2(
@@ -400,6 +431,12 @@ function train_fixed_hyper(
         default_supervised_loss,
         callback_function
     )
+
+    # Freeze the derivative scale from the Stage 1 network
+    frozen_scale = compute_frozen_ode_scale(trainable_params_stage1, ctx_stage2)
+
+    # Rebuild ctx with the correct normalization (structs are immutable)
+    ctx_stage2 = rebuild_ctx_stage2(ctx_stage2, frozen_scale)
 
     # 4. Stage 2: ODE-regularized Training
     ps_trained = run_stage2(
