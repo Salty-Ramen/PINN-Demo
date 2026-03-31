@@ -57,11 +57,14 @@ else
 fi
 
 # ── Generate the job list ─────────────────────────────────
-# 3 configs × 243 HP combos = 729 jobs
-# Each line: <config_key> <hp_index>
-HP_COUNT=243   # 3^5 grid — must match the grid in run_single_baccam.jl
+# Query the HP grid size from sweep_config.jl so the shell script
+# and Julia always agree on the count, whether LHS or Cartesian.
+HP_COUNT=$(julia --project="${PROJECT_DIR}" -e "
+    include(\"${PROJECT_DIR}/sweep_config.jl\")
+    print(length(HP_GRID))
+")
 
-echo "Generating job list..."
+echo "Generating job list (${HP_COUNT} HP combinations per config)..."
 > "${JOBLIST}"   # truncate
 for cfg in A_5x24 B_10x12 C_20x6; do
     for hp in $(seq 1 ${HP_COUNT}); do
@@ -99,7 +102,7 @@ echo ""
 
 parallel "${PARALLEL_OPTS[@]}" \
     julia --project="${PROJECT_DIR}" \
-          "${PROJECT_DIR}/Run-Single-Baccam.jl" {1} {2} \
+          "${PROJECT_DIR}/run_single_baccam.jl" {1} {2} \
     :::: "${JOBLIST}"
 
 # ── Merge per-row CSVs into a single file ─────────────────

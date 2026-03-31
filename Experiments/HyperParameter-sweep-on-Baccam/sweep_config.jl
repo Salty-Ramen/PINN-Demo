@@ -12,16 +12,90 @@ BLAS.set_num_threads(1)
 
 include(joinpath(pwd(), "Src", "Fitting.jl"))
 
-# ── Hyperparameter grid ──────────────────────────────────
+# ── Hyperparameter sampling ───────────────────────────────
 # Each ϵ is an inverse-weight: larger ⟹ weaker penalty.
-const HP_GRID = [
-    HyperParams(ic, ode, dat, l1s, l1g)
-    for ic  in Float32[0.1, 0.5, 1.0],
-        ode in Float32[0.01, 0.1, 0.5],
-        dat in Float32[0.01, 0.04, 0.1],
-        l1s in Float32[0.02, 0.5, 2.0],
-        l1g in Float32[0.02, 0.5, 2.0]
-] |> vec
+#
+# We sample in log-space so that the optimizer explores
+# orders of magnitude uniformly (0.01 → 1.0 gets as many
+# samples as 0.1 → 10.0).
+#
+# Set USE_LHS = true  for Latin Hypercube (better coverage per sample)
+#     USE_LHS = false for Cartesian grid  (regular structure, heatmaps)
+
+const USE_LHS    = true
+const N_LHS      = 100      # samples per config when using LHS
+const LHS_SEED   = 123      # reproducible sampling
+
+# Per-axis bounds in log₁₀ space
+const HP_LOG_BOUNDS = (
+    ϵ_ic       = (-1.5f0, 0.5f0),   # 10^-1.5 ≈ 0.03  to  10^0.5 ≈ 3.2
+    ϵ_ode      = (-2.0f0, 0.0f0),   # 0.01  to  1.0
+    ϵ_Data     = (-2.0f0, -0.5f0),  # 0.01  to  0.32
+    ϵ_L1_state = (-2.0f0, 0.5f0),   # 0.01  to  3.2
+    ϵ_L1_g     = (-2.0f0, 0.5f0),   # 0.01  to  3.2
+)
+
+"""
+    latin_hypercube(rng, n, d) -> Matrix{Float32}
+
+Generate an n × d Latin Hypercube sample in [0, 1]^d.
+Each column (dimension) is divided into n equal strata with
+exactly one sample per stratum, then columns are independently
+shuffled.
+"""
+function latin_hypercube(rng, n::Int, d::Int)
+    lhs = zeros(Float32, n, d)
+    for j in 1:d
+        # One random point per stratum: (i-1)/n + U(0, 1/n)
+        perm = randperm(rng, n)
+        for i in 1:n
+            lhs[perm[i], j] = (i - 1 + rand(rng, Float32)) / n
+        end
+    end
+    return lhs
+end
+
+"""
+    build_hp_grid_lhs(rng, n, bounds) -> Vector{HyperParams}
+
+Map n LHS samples from [0,1]^5 into physical ϵ values via
+log-space interpolation within the given bounds.
+"""
+function build_hp_grid_lhs(rng, n, bounds)
+    raw = latin_hypercube(rng, n, 5)
+    axes = [bounds.ϵ_ic, bounds.ϵ_ode, bounds.ϵ_Data,
+            bounds.ϵ_L1_state, bounds.ϵ_L1_g]
+
+    return [
+        HyperParams(
+            Float32(10^(lo + raw[i,j] * (hi - lo)))
+            for (j, (lo, hi)) in enumerate(axes)
+        ...)
+        for i in 1:n
+    ]
+end
+
+"""
+    build_hp_grid_cartesian() -> Vector{HyperParams}
+
+Full Cartesian product of fixed per-axis values.
+"""
+function build_hp_grid_cartesian()
+    [
+        HyperParams(ic, ode, dat, l1s, l1g)
+        for ic  in Float32[0.1, 0.5, 1.0],
+            ode in Float32[0.01, 0.1, 0.5],
+            dat in Float32[0.01, 0.04, 0.1],
+            l1s in Float32[0.02, 0.5, 2.0],
+            l1g in Float32[0.02, 0.5, 2.0]
+    ] |> vec
+end
+
+const HP_GRID = if USE_LHS
+    build_hp_grid_lhs(MersenneTwister(LHS_SEED), N_LHS, HP_LOG_BOUNDS)
+else
+    build_hp_grid_cartesian()
+end
 
 const VALID_CONFIGS = ["A_5x24", "B_10x12", "C_20x6"]
 
