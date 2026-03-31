@@ -23,8 +23,8 @@ using CSV, DataFrames
 using Printf
 
 # ── Shared config (HP grid, transforms, training constants) ──
-include(joinpath(pwd(), "sweep_config.jl"))
-
+include(joinpath(pwd(),
+                 "Experiments", "HyperParameter-sweep-on-Baccam", "sweep_config.jl"))
 # ══════════════════════════════════════════════════════════
 # 1. Parse CLI arguments
 # ══════════════════════════════════════════════════════════
@@ -172,36 +172,43 @@ println("Starting $run_label  (ϵ_ic=$(hp.ϵ_ic), ϵ_ode=$(hp.ϵ_ode), " *
 
 cb = make_sweep_callback(run_label; patience = 600, min_delta = 1f-7)
 
-wall_t = @elapsed begin
-    local res
-    try
-        res = train_fixed_hyper(
-            data, BaccamArchitectureRaw, BaccamParams, hp;
-            transform            = STATE_TRANSFORM,
-            user_loss_functions   = Function[],
-            maxiters_stage1       = MAXITERS_S1,
-            maxiters_stage2       = MAXITERS_S2,
-            Opt_alg_stage1        = OPT_S1,
-            Opt_alg_stage2        = OPT_S2,
-            callback_function     = cb,
-        )
-    catch e
-        @warn "Run $run_label failed" exception=(e, catch_backtrace())
-        CSV.write(OUTFILE, DataFrame(
-            config = CFG_KEY, hp_idx = HP_IDX,
-            eps_ic = hp.ϵ_ic, eps_ode = hp.ϵ_ode, eps_Data = hp.ϵ_Data,
-            eps_L1_state = hp.ϵ_L1_state, eps_L1_g = hp.ϵ_L1_g,
-            data_mse = NaN, ode_mse = NaN,
-            beta_recovered = NaN, delta_recovered = NaN, c_recovered = NaN,
-            wall_s = wall_t, converged = false,
-        ))
-        exit(1)
-    end
+# Time the training, then handle success/failure outside @elapsed
+# so there are no scoping issues with the result variable.
+t_start = time()
+
+res = try
+    train_fixed_hyper(
+        data, BaccamArchitectureRaw, BaccamParams, hp;
+        transform            = STATE_TRANSFORM,
+        user_loss_functions   = Function[],
+        maxiters_stage1       = MAXITERS_S1,
+        maxiters_stage2       = MAXITERS_S2,
+        Opt_alg_stage1        = OPT_S1,
+        Opt_alg_stage2        = OPT_S2,
+        callback_function     = cb,
+    )
+catch e
+    @warn "Run $run_label failed" exception=(e, catch_backtrace())
+    nothing
 end
+
+wall_t = time() - t_start
 
 # ══════════════════════════════════════════════════════════
 # 6. Write result row
 # ══════════════════════════════════════════════════════════
+
+if isnothing(res)
+    CSV.write(OUTFILE, DataFrame(
+        config = CFG_KEY, hp_idx = HP_IDX,
+        eps_ic = hp.ϵ_ic, eps_ode = hp.ϵ_ode, eps_Data = hp.ϵ_Data,
+        eps_L1_state = hp.ϵ_L1_state, eps_L1_g = hp.ϵ_L1_g,
+        data_mse = NaN, ode_mse = NaN,
+        beta_recovered = NaN, delta_recovered = NaN, c_recovered = NaN,
+        wall_s = Float32(wall_t), converged = false,
+    ))
+    exit(1)
+end
 
 CSV.write(OUTFILE, DataFrame(
     config          = CFG_KEY,
