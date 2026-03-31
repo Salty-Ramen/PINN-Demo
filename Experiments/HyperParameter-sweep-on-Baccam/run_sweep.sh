@@ -51,7 +51,7 @@ if [[ ! -f "${RESULTS_DIR}/Baccam_A_5x24.csv" ]] || \
    [[ ! -f "${RESULTS_DIR}/Baccam_B_10x12.csv" ]] || \
    [[ ! -f "${RESULTS_DIR}/Baccam_C_20x6.csv" ]]; then
     echo "Generating training data..."
-    julia --project="${PROJECT_DIR}" "${PROJECT_DIR}/generate_sweep_data.jl"
+    julia --project="${PROJECT_DIR}" "${PROJECT_DIR}/Experiments/HyperParameter-sweep-on-Baccam/generate_sweep_data.jl"
 else
     echo "Training data CSVs already exist — skipping generation."
 fi
@@ -60,7 +60,7 @@ fi
 # Query the HP grid size from sweep_config.jl so the shell script
 # and Julia always agree on the count, whether LHS or Cartesian.
 HP_COUNT=$(julia --project="${PROJECT_DIR}" -e "
-    include(\"${PROJECT_DIR}/sweep_config.jl\")
+    include(\"${PROJECT_DIR}/Experiments/HyperParameter-sweep-on-Baccam/sweep_config.jl\")
     print(length(HP_GRID))
 ")
 
@@ -102,7 +102,7 @@ echo ""
 
 parallel "${PARALLEL_OPTS[@]}" \
     julia --project="${PROJECT_DIR}" \
-          "${PROJECT_DIR}/run_single_baccam.jl" {1} {2} \
+          "${PROJECT_DIR}/Experiments/HyperParameter-sweep-on-Baccam/run_single_baccam.jl" {1} {2} \
     :::: "${JOBLIST}"
 
 # ── Merge per-row CSVs into a single file ─────────────────
@@ -126,5 +126,5 @@ echo "Merged ${ROW_COUNT} result rows → ${MERGED_CSV}"
 echo ""
 echo "═══════════════════════════════════════════════════"
 echo "  Sweep complete — $(date)"
-echo "  Analyse with:  julia --project=. Baccam_sweep_analysis.jl"
+echo "  Analyse with:  julia --project=. Experiments/HyperParameter-sweep-on-Baccam/Baccam_sweep_analysis.jl"
 echo "═══════════════════════════════════════════════════"
