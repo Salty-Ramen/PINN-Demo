@@ -2,9 +2,15 @@
 #
 # generate_sweep_data.jl
 #
-# Run ONCE before the sweep to produce the training CSVs that every
-# worker reads.  This is the single source of truth for the synthetic
-# data — workers never regenerate it themselves.
+# Run ONCE before the sweep.  Produces per-config CSVs where each row
+# is a single mouse observation (not a per-timepoint mean), preserving
+# the replicate structure that distinguishes the three sampling designs.
+#
+# Output format per CSV:
+#   t, T_obs, I_obs, V_obs, mouse_id, T_true, I_true, V_true
+#
+# The true (noiseless) values are included for downstream plotting but
+# are NOT used during training.
 #
 # Usage:
 #   julia --project=. generate_sweep_data.jl
@@ -40,11 +46,13 @@ sol_array = Array(sol)
 function generate_config(rng, sol_array, t_fine, n_tp, n_mice, noise_σ)
     idx    = round.(Int, range(1, length(t_fine), length = n_tp))
     t_obs  = Float32.(t_fine[idx])
-    Y_true = Float32.(sol_array[:, idx])
+    Y_true = Float32.(sol_array[:, idx])                     # 3 × n_tp
     ε      = randn(rng, Float32, 3, n_tp, n_mice)
-    Y_noisy = clamp.(Y_true .* exp.(noise_σ .* ε .- 0.5f0 * noise_σ^2), 0f0, Inf32)
-    Y_mean  = dropdims(mean(Y_noisy; dims = 3); dims = 3)
-    return (t_obs = t_obs, Y_true = Y_true, Y_mean = Y_mean,
+    Y_noisy = clamp.(
+        Y_true .* exp.(noise_σ .* ε .- 0.5f0 * noise_σ^2),
+        0f0, Inf32
+    )                                                         # 3 × n_tp × n_mice
+    return (t_obs = t_obs, Y_true = Y_true, Y_noisy = Y_noisy,
             n_tp = n_tp, n_mice = n_mice)
 end
 
@@ -56,23 +64,34 @@ configs = Dict(
 )
 
 # ── Write to disk ─────────────────────────────────────────
+# One row per (timepoint, mouse) pair — this is the rawest usable
+# form.  The worker script reshapes it into the 3 × N matrix that
+# train_fixed_hyper expects.
 
 outdir = joinpath(pwd(), "Results")
 mkpath(outdir)
 
 for (label, cfg) in configs
-    df = DataFrame(
-        t      = cfg.t_obs,
-        T_true = cfg.Y_true[1, :],
-        I_true = cfg.Y_true[2, :],
-        V_true = cfg.Y_true[3, :],
-        T_mean = cfg.Y_mean[1, :],
-        I_mean = cfg.Y_mean[2, :],
-        V_mean = cfg.Y_mean[3, :],
-    )
+    rows = NamedTuple[]
+    for m in 1:cfg.n_mice
+        for tp in 1:cfg.n_tp
+            push!(rows, (
+                t      = cfg.t_obs[tp],
+                T_obs  = cfg.Y_noisy[1, tp, m],
+                I_obs  = cfg.Y_noisy[2, tp, m],
+                V_obs  = cfg.Y_noisy[3, tp, m],
+                mouse  = m,
+                T_true = cfg.Y_true[1, tp],
+                I_true = cfg.Y_true[2, tp],
+                V_true = cfg.Y_true[3, tp],
+            ))
+        end
+    end
+    df = DataFrame(rows)
     path = joinpath(outdir, "Baccam_$(label).csv")
     CSV.write(path, df)
-    println("Wrote $path  ($(cfg.n_tp) timepoints × $(cfg.n_mice) mice)")
+    n_obs = cfg.n_tp * cfg.n_mice
+    println("Wrote $path  ($(cfg.n_tp) tp × $(cfg.n_mice) mice = $n_obs observations)")
 end
 
-println("\nData generation complete. Run the sweep next.")
+println("\nData generation complete.")

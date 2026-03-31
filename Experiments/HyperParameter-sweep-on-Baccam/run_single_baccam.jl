@@ -56,6 +56,12 @@ end
 # ══════════════════════════════════════════════════════════
 # 2. Load pre-generated training data from disk
 #    (created by generate_sweep_data.jl — never regenerated)
+#
+#    The CSV has one row per (timepoint, mouse) pair.  We unpack
+#    every individual mouse observation so the optimizer sees the
+#    full replicate scatter — this is what makes Config A (few
+#    timepoints, dense replicates) genuinely different from
+#    Config C (many timepoints, sparse replicates).
 # ══════════════════════════════════════════════════════════
 
 csv_path = joinpath(pwd(), "Results", "Baccam_$(CFG_KEY).csv")
@@ -64,18 +70,20 @@ isfile(csv_path) || error("Training data not found at $csv_path. " *
 
 df = CSV.read(csv_path, DataFrame)
 
-# Reconstruct the arrays that train_fixed_hyper expects
-t_obs  = Float32.(df.t)
-Y_mean = permutedims(Float32.(Matrix(df[:, [:T_mean, :I_mean, :V_mean]])))  # 3 × n_tp
+# Each row is one mouse at one timepoint.  The training matrix has
+# one column per observation: for Config A that's 5×24 = 120 columns,
+# for Config C it's 20×6 = 120 columns — same budget, different structure.
+t_all = Float32.(df.t)
+Y_all = permutedims(Float32.(Matrix(df[:, [:T_obs, :I_obs, :V_obs]])))  # 3 × N_obs
 
-t_train    = permutedims(t_obs)                          # 1 × n_tp
+t_train    = permutedims(t_all)                           # 1 × N_obs
 t_dense    = permutedims(Float32.(range(
-    minimum(t_train), maximum(t_train); length = 1000))) # 1 × 1000
-t_span_vec = Float32[minimum(t_train), maximum(t_train)]
+    minimum(t_all), maximum(t_all); length = 1000)))      # 1 × 1000
+t_span_vec = Float32[minimum(t_all), maximum(t_all)]
 
 data = (
     t_train        = t_train,
-    Y_train        = Y_mean,
+    Y_train        = Y_all,
     Y_train_std    = ones(Float32, 3, 1),
     t_dense        = t_dense,
     t_span         = t_span_vec,
