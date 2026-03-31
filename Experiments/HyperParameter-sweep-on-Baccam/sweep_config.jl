@@ -63,14 +63,18 @@ log-space interpolation within the given bounds.
 """
 function build_hp_grid_lhs(rng, n, bounds)
     raw = latin_hypercube(rng, n, 5)
-    axes = [bounds.ϵ_ic, bounds.ϵ_ode, bounds.ϵ_Data,
-            bounds.ϵ_L1_state, bounds.ϵ_L1_g]
+
+    # Helper: map a [0,1] sample to physical ϵ via log-space interpolation
+    to_phys(u, lo, hi) = Float32(10^(lo + u * (hi - lo)))
 
     return [
         HyperParams(
-            Float32(10^(lo + raw[i,j] * (hi - lo)))
-            for (j, (lo, hi)) in enumerate(axes)
-        ...)
+            to_phys(raw[i, 1], bounds.ϵ_ic...),
+            to_phys(raw[i, 2], bounds.ϵ_ode...),
+            to_phys(raw[i, 3], bounds.ϵ_Data...),
+            to_phys(raw[i, 4], bounds.ϵ_L1_state...),
+            to_phys(raw[i, 5], bounds.ϵ_L1_g...),
+        )
         for i in 1:n
     ]
 end
