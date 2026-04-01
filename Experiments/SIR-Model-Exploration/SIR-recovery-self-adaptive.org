@@ -20,7 +20,8 @@ using ForwardDiff
 using Statistics
 using Random
 using Base.Threads
-using DifferentialEquations
+# using DifferentialEquations
+using OrdinaryDiffEq
 using CairoMakie, Makie
 using CSV, DataFrames
 

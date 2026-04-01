@@ -17,7 +17,8 @@
 
 using Pkg; Pkg.activate(".")
 
-using DifferentialEquations
+# using DifferentialEquations
+using OrdinaryDiffEq
 using Statistics, Random
 using CSV, DataFrames
 
