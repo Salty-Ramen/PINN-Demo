@@ -3,21 +3,17 @@
 # generate_sweep_data.jl
 #
 # Run ONCE before the sweep.  Produces per-config CSVs where each row
-# is a single mouse observation (not a per-timepoint mean), preserving
-# the replicate structure that distinguishes the three sampling designs.
+# is a single mouse observation, preserving replicate structure.
 #
-# Output format per CSV:
-#   t, T_obs, I_obs, V_obs, mouse_id, T_true, I_true, V_true
-#
-# The true (noiseless) values are included for downstream plotting but
-# are NOT used during training.
+# Output directory is passed as CLI arg (defaults to ./Results).
+# This lets run_sweep.sh point it at SCRIPT_DIR/Results so training
+# data lives alongside sweep output.
 #
 # Usage:
-#   julia --project=. generate_sweep_data.jl
+#   julia --project=. generate_sweep_data.jl [output_dir]
 
 using Pkg; Pkg.activate(".")
 
-# using DifferentialEquations
 using OrdinaryDiffEq
 using Statistics, Random
 using CSV, DataFrames
@@ -47,12 +43,12 @@ sol_array = Array(sol)
 function generate_config(rng, sol_array, t_fine, n_tp, n_mice, noise_σ)
     idx    = round.(Int, range(1, length(t_fine), length = n_tp))
     t_obs  = Float32.(t_fine[idx])
-    Y_true = Float32.(sol_array[:, idx])                     # 3 × n_tp
+    Y_true = Float32.(sol_array[:, idx])
     ε      = randn(rng, Float32, 3, n_tp, n_mice)
     Y_noisy = clamp.(
         Y_true .* exp.(noise_σ .* ε .- 0.5f0 * noise_σ^2),
         0f0, Inf32
-    )                                                         # 3 × n_tp × n_mice
+    )
     return (t_obs = t_obs, Y_true = Y_true, Y_noisy = Y_noisy,
             n_tp = n_tp, n_mice = n_mice)
 end
@@ -65,11 +61,8 @@ configs = Dict(
 )
 
 # ── Write to disk ─────────────────────────────────────────
-# One row per (timepoint, mouse) pair — this is the rawest usable
-# form.  The worker script reshapes it into the 3 × N matrix that
-# train_fixed_hyper expects.
-
-outdir = joinpath(pwd(), "Results")
+# Output directory from CLI arg, falling back to ./Results
+outdir = length(ARGS) >= 1 ? ARGS[1] : joinpath(pwd(), "Results")
 mkpath(outdir)
 
 for (label, cfg) in configs

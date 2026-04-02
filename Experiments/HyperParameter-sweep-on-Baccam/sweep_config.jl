@@ -10,6 +10,8 @@
 using LinearAlgebra
 BLAS.set_num_threads(1)
 
+using HDF5
+
 include(joinpath(pwd(), "Src", "Fitting.jl"))
 
 # ── Hyperparameter sampling ───────────────────────────────
@@ -23,7 +25,7 @@ include(joinpath(pwd(), "Src", "Fitting.jl"))
 #     USE_LHS = false for Cartesian grid  (regular structure, heatmaps)
 
 const USE_LHS    = true
-const N_LHS      = 100      # samples per config when using LHS
+const N_LHS      = 900      # samples per config when using LHS; 2 is good for testing
 const LHS_SEED   = 123      # reproducible sampling
 
 # Per-axis bounds in log₁₀ space
@@ -46,7 +48,6 @@ shuffled.
 function latin_hypercube(rng, n::Int, d::Int)
     lhs = zeros(Float32, n, d)
     for j in 1:d
-        # One random point per stratum: (i-1)/n + U(0, 1/n)
         perm = randperm(rng, n)
         for i in 1:n
             lhs[perm[i], j] = (i - 1 + rand(rng, Float32)) / n
@@ -64,7 +65,6 @@ log-space interpolation within the given bounds.
 function build_hp_grid_lhs(rng, n, bounds)
     raw = latin_hypercube(rng, n, 5)
 
-    # Helper: map a [0,1] sample to physical ϵ via log-space interpolation
     to_phys(u, lo, hi) = Float32(10^(lo + u * (hi - lo)))
 
     return [
@@ -126,3 +126,8 @@ const STATE_TRANSFORM = LogTransform(
 
 # ── Initial conditions (from Baccam et al. Table 2) ──────
 const U0 = Float32[4.0f8, 0.0f0, 9.3f-2]
+
+# ── Trajectory evaluation grid (shared across workers) ────
+# Workers evaluate the trained model on this grid and store
+# the predictions in their per-run HDF5 file.
+const N_TRAJ_EVAL = 300

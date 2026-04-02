@@ -3,7 +3,14 @@
 # run_sweep.sh
 #
 # Orchestrates the Baccam hyperparameter sweep using GNU Parallel.
-# Each (config, hp_index) pair runs as an independent Julia process.
+# Each (config, hp_index) pair runs as an independent Julia process
+# that writes a per-worker HDF5 file.
+#
+# Post-sweep merging and plotting are handled entirely by the
+# analysis script (Baccam_sweep_analysis.jl), not by this shell script.
+#
+# All generated data and results live under SCRIPT_DIR/Results,
+# keeping each experiment self-contained.
 #
 # Usage:
 #   chmod +x run_sweep.sh
@@ -13,23 +20,20 @@
 
 set -euo pipefail
 
-# ── Resolve project root from this script's location ──────
-# The script lives at <project>/Experiments/HyperParameter-sweep-on-Baccam/,
-# so we walk two levels up to reach the actual project root.
+# ── Resolve paths ─────────────────────────────────────────
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 
-RESULTS_DIR="${PROJECT_DIR}/Results"
+# All output (training data + sweep results) stays under this experiment
+RESULTS_DIR="${SCRIPT_DIR}/Results"
 ROW_DIR="${RESULTS_DIR}/sweep_rows"
 JOBLIST="${RESULTS_DIR}/joblist.txt"
 JOBLOG="${RESULTS_DIR}/sweep_joblog.txt"
-MERGED_CSV="${RESULTS_DIR}/Baccam_hp_sweep.csv"
 
-# Sweep config path (used in multiple places below)
 SWEEP_CFG="${SCRIPT_DIR}/sweep_config.jl"
 
-MAX_JOBS="${1:-$(nproc)}"        # default: all cores on this machine
-RESUME_FLAG="${2:-}"             # pass "resume" as 2nd arg to skip completed jobs
+MAX_JOBS="${1:-$(nproc)}"
+RESUME_FLAG="${2:-}"
 
 mkdir -p "${ROW_DIR}"
 
@@ -47,31 +51,29 @@ command -v julia >/dev/null 2>&1 || {
     exit 1
 }
 
-# ── Precompile once to avoid redundant JIT across workers ─
+# ── Precompile once ───────────────────────────────────────
 echo "Precompiling project dependencies (one-time cost)..."
 julia --project="${PROJECT_DIR}" -e 'using Pkg; Pkg.instantiate(); Pkg.precompile()'
 
-# ── Generate training data if it doesn't already exist ────
+# ── Generate training data into SCRIPT_DIR/Results ────────
 if [[ ! -f "${RESULTS_DIR}/Baccam_A_5x24.csv" ]] || \
    [[ ! -f "${RESULTS_DIR}/Baccam_B_10x12.csv" ]] || \
    [[ ! -f "${RESULTS_DIR}/Baccam_C_20x6.csv" ]]; then
-    echo "Generating training data..."
-    # cd into project root so pwd()-based includes resolve correctly
+    echo "Generating training data into ${RESULTS_DIR}..."
     (cd "${PROJECT_DIR}" && julia --project="${PROJECT_DIR}" \
-        "${SCRIPT_DIR}/generate_sweep_data.jl")
+        "${SCRIPT_DIR}/generate_sweep_data.jl" "${RESULTS_DIR}")
 else
     echo "Training data CSVs already exist — skipping generation."
 fi
 
 # ── Query HP grid size from sweep_config.jl ───────────────
-# cd into project root because sweep_config.jl includes Fitting.jl via pwd()
 HP_COUNT=$(cd "${PROJECT_DIR}" && julia --project="${PROJECT_DIR}" -e "
     include(\"${SWEEP_CFG}\")
     print(length(HP_GRID))
 ")
 
-echo "Generating job list (${HP_COUNT} HP combinations per config)..."
-> "${JOBLIST}"   # truncate
+echo "Generating job list (${HP_COUNT} HP combinations × 3 configs)..."
+> "${JOBLIST}"
 for cfg in A_5x24 B_10x12 C_20x6; do
     for hp in $(seq 1 "${HP_COUNT}"); do
         echo "${cfg} ${hp}"
@@ -82,15 +84,15 @@ TOTAL=$(wc -l < "${JOBLIST}")
 echo "Total jobs: ${TOTAL}"
 echo "Concurrent workers: ${MAX_JOBS}"
 
-# ── Build the GNU Parallel command ────────────────────────
+# ── GNU Parallel options ──────────────────────────────────
 PARALLEL_OPTS=(
     --jobs "${MAX_JOBS}"
     --colsep ' '
     --joblog "${JOBLOG}"
     --progress
     --bar
-    --timeout 7200           # kill any single run that exceeds 2 hours
-    --retries 1              # retry once on failure (covers transient OOM etc.)
+    --timeout 7200
+    --retries 1
 )
 
 if [[ "${RESUME_FLAG}" == "resume" ]]; then
@@ -104,32 +106,28 @@ echo "  Launching sweep — $(date)"
 echo "═══════════════════════════════════════════════════"
 echo ""
 
-# Each worker cd's into the project root before launching Julia,
-# ensuring that pwd()-based path resolution in the Julia code
-# (e.g. joinpath(pwd(), "Src", "Fitting.jl")) finds the right files.
+# ── Write sweep metadata for reproducibility ──────────────
+# Captures HP grid, bounds, training constants, git state, and
+# Julia version into a standalone HDF5 before any workers launch.
+METADATA_H5="${RESULTS_DIR}/sweep_metadata.h5"
+(cd "${PROJECT_DIR}" && julia --project="${PROJECT_DIR}" \
+    "${SCRIPT_DIR}/write_sweep_metadata.jl" \
+    "${RESULTS_DIR}" "${PROJECT_DIR}" "${MAX_JOBS}")
+
+# ── Launch parallel sweep ─────────────────────────────────
+
+# Each worker receives SCRIPT_DIR as a third argument so it can
+# resolve paths to sweep_config.jl and SCRIPT_DIR/Results independently.
 parallel "${PARALLEL_OPTS[@]}" \
     "cd ${PROJECT_DIR} && julia --project=${PROJECT_DIR} \
-          ${SCRIPT_DIR}/run_single_baccam.jl {1} {2}" \
+          ${SCRIPT_DIR}/run_single_baccam.jl {1} {2} ${SCRIPT_DIR}" \
     :::: "${JOBLIST}"
-
-# ── Merge per-row CSVs into a single file ─────────────────
-echo ""
-echo "Merging results..."
-
-FIRST_ROW=$(find "${ROW_DIR}" -name 'row_*.csv' | head -1)
-if [[ -z "${FIRST_ROW}" ]]; then
-    echo "WARNING: No result files found in ${ROW_DIR}."
-    exit 1
-fi
-
-head -1 "${FIRST_ROW}" > "${MERGED_CSV}"
-tail -n +2 -q "${ROW_DIR}"/row_*.csv >> "${MERGED_CSV}"
-
-ROW_COUNT=$(tail -n +2 "${MERGED_CSV}" | wc -l)
-echo "Merged ${ROW_COUNT} result rows → ${MERGED_CSV}"
 
 echo ""
 echo "═══════════════════════════════════════════════════"
 echo "  Sweep complete — $(date)"
-echo "  Analyse with:  julia --project=. ${SCRIPT_DIR}/Baccam_sweep_analysis.jl"
+echo ""
+echo "  Merge & analyse with:"
+echo "    cd ${PROJECT_DIR}"
+echo "    julia --project=. ${SCRIPT_DIR}/Baccam_sweep_analysis.jl"
 echo "═══════════════════════════════════════════════════"
