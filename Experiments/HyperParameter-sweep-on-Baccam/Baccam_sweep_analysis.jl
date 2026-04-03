@@ -513,7 +513,7 @@ end
 # per-mouse noise spread, replacing the old scatter of means.
 # ══════════════════════════════════════════════════════════
 
-const N_TOP = 15   # number of Pareto-best trajectories to overlay
+const N_TOP = 5   # number of Pareto-best trajectories to overlay
 
 function Baccam_model!(du, u, p, t)
     T, I, V = u
