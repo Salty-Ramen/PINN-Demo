@@ -3,10 +3,15 @@
 # Baccam_sweep_analysis.jl
 #
 # Merges per-worker HDF5 files from the sweep into a single master HDF5,
-# then generates diagnostic plots. Replaces the old CSV-based workflow.
+# then generates diagnostic plots. Can skip the merge step by passing
+# a pre-existing master HDF5 as a second CLI argument.
 #
 # Usage:
-#   julia --project=. Baccam_sweep_analysis.jl [path/to/experiment/Results]
+#   # Full merge + plot (default):
+#   julia --project=. Baccam_sweep_analysis.jl [results_dir]
+#
+#   # Skip merge, use existing master HDF5:
+#   julia --project=. Baccam_sweep_analysis.jl [results_dir] --master path/to/master.h5
 
 using Pkg; Pkg.activate(".")
 
@@ -17,21 +22,44 @@ using Printf, Statistics
 using OrdinaryDiffEq
 
 # ══════════════════════════════════════════════════════════
-# 0. Resolve experiment results directory
+# 0. Parse CLI arguments
+#
+# Positional:
+#   ARGS[1]  — results directory (default: project-relative)
+#
+# Optional flag:
+#   --master <path>  — skip merge, load this HDF5 directly
 # ══════════════════════════════════════════════════════════
 
-const RESULTS_DIR = length(ARGS) >= 1 ? ARGS[1] :
-    joinpath(pwd(), "Experiments", "HyperParameter-sweep-on-Baccam", "Results")
+function parse_cli(args)
+    results_dir = joinpath(pwd(), "Experiments", "HyperParameter-sweep-on-Baccam", "Results")
+    master_override = nothing
 
-const ROW_DIR    = joinpath(RESULTS_DIR, "sweep_rows")
-const MASTER_H5  = joinpath(RESULTS_DIR, "Baccam_hp_sweep.h5")
+    i = 1
+    while i <= length(args)
+        if args[i] == "--master"
+            i + 1 <= length(args) || error("--master requires a path argument")
+            master_override = args[i + 1]
+            i += 2
+        else
+            # First positional arg is results_dir
+            results_dir = args[i]
+            i += 1
+        end
+    end
+
+    return results_dir, master_override
+end
+
+const RESULTS_DIR, MASTER_OVERRIDE = parse_cli(ARGS)
+
+const ROW_DIR   = joinpath(RESULTS_DIR, "sweep_rows")
+const MASTER_H5 = isnothing(MASTER_OVERRIDE) ?
+    joinpath(RESULTS_DIR, "Baccam_hp_sweep.h5") : MASTER_OVERRIDE
 
 # ══════════════════════════════════════════════════════════
 # 1. Merge per-worker HDF5 → master HDF5
-#
-# Each worker file has /scalars (flat metrics) and optionally
-# /trajectories (model predictions). We aggregate scalars into
-# a columnar layout and copy trajectories under a per-run group.
+#    (skipped entirely when --master is provided)
 # ══════════════════════════════════════════════════════════
 
 """
@@ -65,7 +93,6 @@ function merge_sweep_rows(row_dir, master_path, results_dir)
         for fpath in h5_files
             row = Dict{String,Any}()
             h5open(fpath, "r") do fid
-                # ── Scalars ───────────────────────────────
                 g_sc = fid["scalars"]
                 for k in scalar_keys
                     row[k] = read(g_sc, k)
@@ -73,7 +100,6 @@ function merge_sweep_rows(row_dir, master_path, results_dir)
 
                 run_label = "$(row["config"])_hp$(row["hp_idx"])"
 
-                # ── Trajectories (successful runs only) ───
                 if haskey(fid, "trajectories")
                     g_run = create_group(g_traj, run_label)
                     g_src = fid["trajectories"]
@@ -82,7 +108,6 @@ function merge_sweep_rows(row_dir, master_path, results_dir)
                     end
                 end
 
-                # ── Diagnostics (loss curves, all runs) ───
                 if haskey(fid, "diagnostics")
                     g_drun = create_group(g_diag, run_label)
                     g_dsrc = fid["diagnostics"]
@@ -94,19 +119,16 @@ function merge_sweep_rows(row_dir, master_path, results_dir)
             push!(rows, row)
         end
 
-        # ── Merged scalars as columnar datasets ───────────
         g_sc_merged = create_group(master, "scalars")
         for k in scalar_keys
             col = [r[k] for r in rows]
             g_sc_merged[k] = col
         end
 
-        # ── Copy sweep metadata if it exists ──────────────
         meta_path = joinpath(results_dir, "sweep_metadata.h5")
         if isfile(meta_path)
             h5open(meta_path, "r") do mfid
                 g_meta = create_group(master, "metadata")
-                # Recursively copy all datasets from the metadata file
                 function copy_h5_group(src, dst)
                     for k in keys(src)
                         obj = src[k]
@@ -127,21 +149,52 @@ function merge_sweep_rows(row_dir, master_path, results_dir)
     end
 
     df = DataFrame(rows)
-    rename_map = Dict(
-        "eps_ic" => "ϵ_ic", "eps_ode" => "ϵ_ode", "eps_Data" => "ϵ_Data",
-        "eps_L1_state" => "ϵ_L1_state", "eps_L1_g" => "ϵ_L1_g",
-        "beta_recovered" => "β_recovered",
-        "delta_recovered" => "δ_recovered",
-    )
-    for (old, new) in rename_map
-        old in names(df) && rename!(df, old => new)
-    end
-
-    println("Merged $(length(rows)) runs → $master_path")
     return df
 end
 
-df_all = merge_sweep_rows(ROW_DIR, MASTER_H5, RESULTS_DIR)
+"""
+    load_master_h5(master_path) -> DataFrame
+
+Read the columnar scalars from an already-merged master HDF5
+and return them as a DataFrame. No worker files are touched.
+"""
+function load_master_h5(master_path)
+    isfile(master_path) || error("Master HDF5 not found: $master_path")
+
+    scalar_keys = [
+        "config", "hp_idx",
+        "eps_ic", "eps_ode", "eps_Data", "eps_L1_state", "eps_L1_g",
+        "data_mse", "ode_mse",
+        "beta_recovered", "delta_recovered", "c_recovered",
+        "wall_s", "converged",
+    ]
+
+    cols = h5open(master_path, "r") do fid
+        g_sc = fid["scalars"]
+        Dict(k => read(g_sc, k) for k in scalar_keys)
+    end
+
+    println("Loaded $(length(cols["config"])) runs from $master_path (merge skipped).")
+    return DataFrame(cols)
+end
+
+# ── Decide whether to merge or load ──────────────────────
+df_all = if !isnothing(MASTER_OVERRIDE)
+    load_master_h5(MASTER_H5)
+else
+    merge_sweep_rows(ROW_DIR, MASTER_H5, RESULTS_DIR)
+end
+
+# Standardise column names regardless of source
+rename_map = Dict(
+    "eps_ic" => "ϵ_ic", "eps_ode" => "ϵ_ode", "eps_Data" => "ϵ_Data",
+    "eps_L1_state" => "ϵ_L1_state", "eps_L1_g" => "ϵ_L1_g",
+    "beta_recovered" => "β_recovered",
+    "delta_recovered" => "δ_recovered",
+)
+for (old, new) in rename_map
+    old in names(df_all) && rename!(df_all, old => new)
+end
 
 # Keep only converged runs with finite losses for plotting
 df = filter(r -> r.converged && isfinite(r.data_mse) && isfinite(r.ode_mse), df_all)
@@ -151,6 +204,13 @@ println("$(nrow(df)) converged runs with finite losses (of $(nrow(df_all)) total
 # Utility: Pareto front mask (minimize both objectives)
 # ══════════════════════════════════════════════════════════
 
+"""
+    pareto_front_mask(x, y) -> BitVector
+
+Return a boolean mask where `true` marks non-dominated points.
+A point (xᵢ, yᵢ) is dominated if some other point is ≤ on both
+objectives and strictly < on at least one.
+"""
 function pareto_front_mask(x, y)
     n = length(x)
     dominated = falses(n)
@@ -164,6 +224,97 @@ function pareto_front_mask(x, y)
         end
     end
     return .!dominated
+end
+
+# ══════════════════════════════════════════════════════════
+# Utility: Pareto-based "best" run selection
+#
+# Normalisation is done in log₁₀ space. Both Data MSE and
+# ODE MSE span orders of magnitude, so raw min-max would
+# compress the meaningful variation at the low end. Working
+# in log₁₀ ensures that a 10× improvement contributes
+# equally regardless of absolute scale.
+# ══════════════════════════════════════════════════════════
+
+"""
+    _nadir_scores(data_mse, ode_mse) -> Vector{Float64}
+
+Score each run by its distance from the nadir (worst) point in
+min-max normalised objective space. Higher score = better compromise.
+
+Each axis is min-max scaled to [0, 1] in raw (linear) space.
+The nadir is (1, 1). The returned score is the Euclidean distance
+from (1, 1), so larger = better.
+"""
+function _nadir_scores(data_mse, ode_mse)
+    d = Float64.(data_mse)
+    o = Float64.(ode_mse)
+
+    d_range = max(maximum(d) - minimum(d), 1e-12)
+    o_range = max(maximum(o) - minimum(o), 1e-12)
+
+    # Normalise to [0, 1] where 0 = best, 1 = worst on each axis
+    d_norm = (d .- minimum(d)) ./ d_range
+    o_norm = (o .- minimum(o)) ./ o_range
+
+    # Distance from nadir (1, 1) — larger means farther from worst
+    return sqrt.((1.0 .- d_norm) .^ 2 .+ (1.0 .- o_norm) .^ 2)
+end
+
+"""
+    select_pareto_best(sub::DataFrame) -> DataFrameRow
+
+From a per-config subset `sub`, identify the Pareto front in
+(data_mse, ode_mse) space, then return the point farthest from
+the nadir (1, 1) in log₁₀-normalised coordinates. This selects
+the "elbow" of convex fronts where neither objective is sacrificed.
+
+Falls back to the single Pareto point if the front is degenerate.
+"""
+function select_pareto_best(sub::DataFrame)
+    mask = pareto_front_mask(sub.data_mse, sub.ode_mse)
+    pareto_sub = sub[mask, :]
+
+    nrow(pareto_sub) <= 1 && return first(eachrow(pareto_sub))
+
+    scores = _nadir_scores(pareto_sub.data_mse, pareto_sub.ode_mse)
+    # Maximize distance from nadir → best compromise
+    return pareto_sub[argmax(scores), :]
+end
+
+"""
+    select_pareto_top(sub::DataFrame, n::Int) -> DataFrame
+
+Return up to `n` Pareto-optimal runs from `sub`, sorted by
+nadir distance (descending — best compromise first).
+
+The `nadir_dist` column is added so downstream code can use it
+for colouring and ranking.
+"""
+function select_pareto_top(sub::DataFrame, n::Int)
+    mask = pareto_front_mask(sub.data_mse, sub.ode_mse)
+    pareto_sub = copy(sub[mask, :])
+
+    nrow(pareto_sub) <= 1 && begin
+        pareto_sub.nadir_dist = [0.0]
+        return pareto_sub
+    end
+
+    pareto_sub.nadir_dist = _nadir_scores(pareto_sub.data_mse, pareto_sub.ode_mse)
+    # Sort descending: highest nadir distance = best elbow compromise
+    sorted = sort(pareto_sub, :nadir_dist; rev = true)
+    return first(sorted, min(n, nrow(sorted)))
+end
+
+"""
+    nadir_scores_all(sub::DataFrame) -> Vector{Float64}
+
+Compute log₁₀-normalised nadir distance for ALL runs in `sub`
+(not just Pareto-optimal ones). Used for colouring heatmaps —
+higher score means better balanced performance on both objectives.
+"""
+function nadir_scores_all(sub::DataFrame)
+    return _nadir_scores(sub.data_mse, sub.ode_mse)
 end
 
 # ══════════════════════════════════════════════════════════
@@ -207,6 +358,12 @@ for (col, cfg) in enumerate(config_keys)
         color = :red, markersize = 10, marker = :star5,
         label = "Pareto front")
 
+    best = select_pareto_best(sub)
+    scatter!(ax, [best.data_mse], [best.ode_mse];
+        color = :gold, markersize = 14, marker = :diamond,
+        strokecolor = :black, strokewidth = 1.5,
+        label = "Pareto best")
+
     col == 1 && axislegend(ax; position = :rt, labelsize = 9)
 end
 
@@ -217,7 +374,7 @@ Label(fig1[0, 1:length(config_keys)],
 save(joinpath(RESULTS_DIR, "sweep_pareto.pdf"), fig1; px_per_unit = 600/72)
 
 # ══════════════════════════════════════════════════════════
-# 3. Parameter recovery: top runs per config
+# 3. Parameter recovery: Pareto-optimal runs per config
 # ══════════════════════════════════════════════════════════
 
 fig2 = Figure(size = (1000, 350), fontsize = 12)
@@ -238,8 +395,9 @@ for (col, (name, sym, truth)) in enumerate(param_info)
     )
 
     for (i, cfg) in enumerate(config_keys)
-        sub = sort(filter(r -> r.config == cfg, df), :ode_mse)
-        top = first(sub, min(10, nrow(sub)))
+        sub = filter(r -> r.config == cfg, df)
+        pareto_mask = pareto_front_mask(sub.data_mse, sub.ode_mse)
+        top = sub[pareto_mask, :]
         vals = top[!, sym]
 
         xs = fill(Float64(i), length(vals)) .+ 0.1 .* randn(length(vals))
@@ -256,52 +414,107 @@ for (col, (name, sym, truth)) in enumerate(param_info)
 end
 
 Label(fig2[0, 1:3],
-    "Parameter recovery — top 10 runs by ODE loss per config";
+    "Parameter recovery — Pareto-optimal runs per config";
     fontsize = 14, tellwidth = false)
 
 save(joinpath(RESULTS_DIR, "sweep_param_recovery.pdf"), fig2; px_per_unit = 600/72)
 
 # ══════════════════════════════════════════════════════════
-# 4. Sensitivity heatmaps
+# 4. Sensitivity heatmaps — full pairwise triangle matrix
+#
+# All C(5,2) = 10 ϵ pairs are shown in a lower-triangle
+# layout. Each panel is a scatter of the two ϵ values
+# coloured by log₁₀-normalised utopia distance (lower =
+# better on both objectives simultaneously).
+#
+# Diagonal panels show marginal histograms of each ϵ,
+# weighted by inverse utopia distance so that good runs
+# contribute more visual mass.
 # ══════════════════════════════════════════════════════════
 
-fig3 = Figure(size = (1200, 800), fontsize = 11)
+const hp_names  = ["ϵ_ic", "ϵ_ode", "ϵ_Data", "ϵ_L1_state", "ϵ_L1_g"]
+const hp_syms   = [Symbol(n) for n in hp_names]
+const N_HP      = length(hp_names)
 
-for (row, cfg) in enumerate(config_keys)
+for cfg in config_keys
     sub = filter(r -> r.config == cfg, df)
+    scores = nadir_scores_all(sub)
 
-    ax1 = Makie.Axis(fig3[row, 1];
-        title  = "$cfg — ODE loss by (ϵ_ode, ϵ_Data)",
-        xlabel = "ϵ_ode", ylabel = "ϵ_Data",
-        xscale = log10, yscale = log10,
-    )
-    sc1 = scatter!(ax1, sub.ϵ_ode, sub.ϵ_Data;
-        color = log10.(sub.ode_mse),
-        colormap = :viridis, markersize = 8)
-    Colorbar(fig3[row, 2], sc1; label = "log₁₀(ODE MSE)")
+    # High nadir distance = good compromise; use directly for colouring
+    color_vals = scores
 
-    ax2 = Makie.Axis(fig3[row, 3];
-        title  = "$cfg — ODE loss by (ϵ_L1_state, ϵ_L1_g)",
-        xlabel = "ϵ_L1_state", ylabel = "ϵ_L1_g",
-        xscale = log10, yscale = log10,
-    )
-    sc2 = scatter!(ax2, sub.ϵ_L1_state, sub.ϵ_L1_g;
-        color = log10.(sub.ode_mse),
-        colormap = :viridis, markersize = 8)
-    Colorbar(fig3[row, 4], sc2; label = "log₁₀(ODE MSE)")
+    fig_tri = Figure(size = (1200, 1200), fontsize = 10)
+    Label(fig_tri[0, 1:N_HP], "$cfg — pairwise ϵ sensitivity (colour = utopia distance)";
+        fontsize = 14, tellwidth = false)
+
+    for row in 1:N_HP, col in 1:N_HP
+        if col > row
+            # Upper triangle: leave empty
+            continue
+        elseif col == row
+            # Diagonal: marginal histogram of this ϵ
+            ax = Makie.Axis(fig_tri[row, col];
+                xlabel = row == N_HP ? hp_names[col] : "",
+                ylabel = "",
+                xscale = log10,
+                topspinevisible = false, rightspinevisible = false,
+                xticklabelsize = 8, yticklabelsize = 8,
+            )
+            # Pass raw values — the axis xscale = log10 handles the transform
+            hist!(ax, sub[!, hp_syms[col]];
+                bins = 25, color = (config_colors[cfg], 0.6))
+
+            # Hide y-axis ticks on diagonal — counts aren't meaningful
+            hideydecorations!(ax; grid = false)
+        else
+            # Lower triangle: pairwise scatter
+            ax = Makie.Axis(fig_tri[row, col];
+                xlabel = row == N_HP ? hp_names[col] : "",
+                ylabel = col == 1    ? hp_names[row] : "",
+                xscale = log10, yscale = log10,
+                topspinevisible = false, rightspinevisible = false,
+                xticklabelsize = 8, yticklabelsize = 8,
+            )
+
+            sc = scatter!(ax,
+                sub[!, hp_syms[col]],
+                sub[!, hp_syms[row]];
+                color = color_vals,
+                colormap = Reverse(:viridis),
+                markersize = 5,
+                alpha = 0.7,
+            )
+
+            # Shared colorbar: place once in the upper-right corner
+            if row == 2 && col == 1
+                Colorbar(fig_tri[1, N_HP], sc;
+                    label = "Nadir dist (higher = better)",
+                    flipaxis = true,
+                )
+            end
+
+            # Suppress axis labels on interior panels to reduce clutter
+            row != N_HP && hidexdecorations!(ax; grid = false)
+            col != 1    && hideydecorations!(ax; grid = false)
+        end
+    end
+
+    save(joinpath(RESULTS_DIR, "sweep_sensitivity_triangle_$(cfg).pdf"),
+         fig_tri; px_per_unit = 600/72)
+    println("Saved triangle heatmap for $cfg")
 end
 
-save(joinpath(RESULTS_DIR, "sweep_sensitivity.pdf"), fig3; px_per_unit = 600/72)
-
 # ══════════════════════════════════════════════════════════
-# 5. Best trajectory per config — loaded from HDF5
+# 5. Top-N Pareto trajectories per config
 #
-# For each config, find the run with the lowest ODE MSE and
-# plot its stored state and g predictions against the true ODE.
-# No model re-evaluation needed.
+# Shows the top N_TOP Pareto-optimal runs coloured by their
+# utopia distance (darker = closer to ideal). Training data
+# is shown as boxplots at each timepoint to visualise the
+# per-mouse noise spread, replacing the old scatter of means.
 # ══════════════════════════════════════════════════════════
 
-# Solve the ground-truth ODE once for the reference curves
+const N_TOP = 5   # number of Pareto-best trajectories to overlay
+
 function Baccam_model!(du, u, p, t)
     T, I, V = u
     du[1] = -p.β * T * V
@@ -319,35 +532,22 @@ sol_true    = solve(
 sol_array = Array(sol_true)
 
 state_labels = ["Target T(t)", "Infected I(t)", "Virus V(t)"]
+obs_syms     = [:T_obs, :I_obs, :V_obs]
 
-fig4 = Figure(size = (1200, 700), fontsize = 12)
+fig4 = Figure(size = (1200, 800), fontsize = 12)
 
 for (col, cfg) in enumerate(config_keys)
-    # Identify the best run (lowest ODE MSE) for this config
-    sub = sort(filter(r -> r.config == cfg, df), :ode_mse)
-    best = first(sub)
-    run_label = "$(best.config)_hp$(best.hp_idx)"
+    sub = filter(r -> r.config == cfg, df)
+    top_runs = select_pareto_top(sub, N_TOP)
 
-    # Read the stored trajectory from the master HDF5
-    t_eval, y_hat, g_hat = h5open(MASTER_H5, "r") do fid
-        g_run = fid["trajectories/$run_label"]
-        (
-            read(g_run, "t_eval"),
-            read(g_run, "state_pred"),
-            read(g_run, "g_pred"),
-        )
-    end
-
-    # Load training data for scatter overlay
+    # Load per-mouse training data for boxplots
     csv_path = joinpath(RESULTS_DIR, "Baccam_$(cfg).csv")
     df_data = CSV.read(csv_path, DataFrame)
-    # Compute per-timepoint mean across mice (for the scatter)
-    df_mean = combine(
-        groupby(df_data, :t),
-        :T_obs => mean => :T_mean,
-        :I_obs => mean => :I_mean,
-        :V_obs => mean => :V_mean,
-    )
+
+    # Determine boxplot width from the minimum gap between timepoints
+    unique_t = sort(unique(df_data.t))
+    box_width = length(unique_t) > 1 ?
+        0.6f0 * minimum(diff(unique_t)) : 0.3f0
 
     for row in 1:3
         ax = Makie.Axis(fig4[row, col];
@@ -361,91 +561,154 @@ for (col, cfg) in enumerate(config_keys)
             titlesize = 11, titlealign = :left,
         )
         if row == 1
-            label_text = @sprintf("%s  (hp%d, ODE=%.1e)", cfg, best.hp_idx, best.ode_mse)
-            Label(fig4[0, col], label_text; fontsize = 12, tellwidth = false)
+            Label(fig4[0, col], cfg; fontsize = 13, tellwidth = false)
         end
 
         # True ODE reference curve
         lines!(ax, t_fine, sol_array[row, :];
             color = :grey60, linewidth = 1.5, linestyle = :dash)
 
-        # Best-run NN prediction (loaded from HDF5, no refitting)
-        lines!(ax, t_eval, y_hat[row, :];
-            color = :black, linewidth = 2)
+        # Plot trajectories first so boxplots render on top
+        nd_min = minimum(top_runs.nadir_dist)
+        nd_max = maximum(top_runs.nadir_dist)
+        nd_range = max(nd_max - nd_min, 1e-12)
 
-        # Training data (mouse-averaged)
-        obs_col = [:T_mean, :I_mean, :V_mean][row]
-        scatter!(ax, df_mean.t, df_mean[!, obs_col];
-            markersize = 7, color = :white,
-            strokecolor = :black, strokewidth = 1.5)
+        for r in eachrow(top_runs)
+            run_label = "$(r.config)_hp$(r.hp_idx)"
+
+            t_eval, y_hat = h5open(MASTER_H5, "r") do fid
+                g_run = fid["trajectories/$run_label"]
+                (read(g_run, "t_eval"), read(g_run, "state_pred"))
+            end
+
+            # Normalised: 1 = best (highest nadir dist), 0 = worst among top-N
+            nd_frac = (r.nadir_dist - nd_min) / nd_range
+
+            lines!(ax, t_eval, y_hat[row, :];
+                color = nd_frac,
+                colorrange = (0.0, 1.0),
+                colormap = Reverse(:viridis),
+                linewidth = 2)
+        end
+
+        # Boxplots on top for readability
+        boxplot!(ax,
+            df_data.t,
+            df_data[!, obs_syms[row]];
+            width = box_width,
+            color = (:grey80, 0.5),
+            whiskerwidth = 0.4,
+            strokewidth = 0.8,
+            mediancolor = :black,
+            medianlinewidth = 1.5,
+            outliercolor = (:black, 0.3),
+            markersize = 3,
+        )
     end
 end
 
-Legend(fig4[4, 1:3],
+# Colorbar for the utopia distance colour ramp
+Colorbar(fig4[4, 3];
+    colormap = Reverse(:viridis),
+    limits = (0.0, 1.0),
+    label = "Nadir distance (normalised, blue = best)",
+    vertical = false,
+    flipaxis = false,
+    tellwidth = false,
+)
+
+Legend(fig4[4, 1:2],
     [LineElement(color = :grey60, linewidth = 1.5, linestyle = :dash),
-     LineElement(color = :black, linewidth = 2),
-     MarkerElement(marker = :circle, markersize = 7, color = :white,
-                   strokecolor = :black, strokewidth = 1.5)],
-    ["True ODE", "Best NN(t, θ)", "Training data (mouse mean)"],
+     MarkerElement(marker = :rect, markersize = 12, color = (:grey80, 0.5),
+                   strokecolor = :black, strokewidth = 0.8)],
+    ["True ODE", "Mouse data (boxplot)"],
     orientation = :horizontal, tellwidth = false)
 
 save(joinpath(RESULTS_DIR, "sweep_best_trajectories.pdf"), fig4; px_per_unit = 600/72)
 
 # ══════════════════════════════════════════════════════════
-# 6. Best g-functions per config (from HDF5)
+# 6. Top-N g-functions per config (Pareto-selected, from HDF5)
+#
+# Same top-N overlay approach as the state trajectories,
+# coloured by utopia distance.
 # ══════════════════════════════════════════════════════════
 
 fig5 = Figure(size = (1200, 400), fontsize = 12)
 
 for (col, cfg) in enumerate(config_keys)
-    sub = sort(filter(r -> r.config == cfg, df), :ode_mse)
-    best = first(sub)
-    run_label = "$(best.config)_hp$(best.hp_idx)"
-
-    t_eval, g_hat = h5open(MASTER_H5, "r") do fid
-        g_run = fid["trajectories/$run_label"]
-        (read(g_run, "t_eval"), read(g_run, "g_pred"))
-    end
+    sub = filter(r -> r.config == cfg, df)
+    top_runs = select_pareto_top(sub, N_TOP)
 
     ax1 = Makie.Axis(fig5[1, col];
-        title = "g_T  ($cfg, hp$(best.hp_idx))",
+        title = "g_T  ($cfg)",
         xlabel = "Days p.i.",
         xgridvisible = true, ygridvisible = true,
         topspinevisible = false, rightspinevisible = false,
         xticklabelsize = 9, yticklabelsize = 9,
         titlesize = 11, titlealign = :left)
-    lines!(ax1, t_eval, vec(g_hat[1, :]); color = :black, linewidth = 2)
 
     ax2 = Makie.Axis(fig5[2, col];
-        title = "g_V  ($cfg, hp$(best.hp_idx))",
+        title = "g_V  ($cfg)",
         xlabel = "Days p.i.",
         xgridvisible = true, ygridvisible = true,
         topspinevisible = false, rightspinevisible = false,
         xticklabelsize = 9, yticklabelsize = 9,
         titlesize = 11, titlealign = :left)
-    lines!(ax2, t_eval, vec(g_hat[2, :]); color = :black, linewidth = 2)
+
+    nd_min = minimum(top_runs.nadir_dist)
+    nd_max = maximum(top_runs.nadir_dist)
+    nd_range = max(nd_max - nd_min, 1e-12)
+
+    for r in eachrow(top_runs)
+        run_label = "$(r.config)_hp$(r.hp_idx)"
+
+        t_eval, g_hat = h5open(MASTER_H5, "r") do fid
+            g_run = fid["trajectories/$run_label"]
+            (read(g_run, "t_eval"), read(g_run, "g_pred"))
+        end
+
+        nd_frac = (r.nadir_dist - nd_min) / nd_range
+
+        lines!(ax1, t_eval, vec(g_hat[1, :]);
+            color = nd_frac, colorrange = (0.0, 1.0),
+            colormap = Reverse(:viridis), linewidth = 2)
+        lines!(ax2, t_eval, vec(g_hat[2, :]);
+            color = nd_frac, colorrange = (0.0, 1.0),
+            colormap = Reverse(:viridis), linewidth = 2)
+    end
 end
 
-Label(fig5[0, 1:3], "Learned unknown physics g(t, θ_g) — best run per config";
+Label(fig5[0, 1:3],
+    "Learned unknown physics g(t, θ_g) — top $N_TOP Pareto runs per config";
     fontsize = 14, tellwidth = false)
+
+Legend(fig5[3, 1:2],
+    [LineElement(color = :grey60, linewidth = 1.5, linestyle = :dash)],
+    ["True ODE (if overlaid)"],
+    orientation = :horizontal, tellwidth = false)
+
+Colorbar(fig5[3, 3];
+    colormap = Reverse(:viridis),
+    limits = (0.0, 1.0),
+    label = "Nadir distance (normalised, blue = best)",
+    vertical = false,
+    flipaxis = false,
+    tellwidth = false,
+)
 
 save(joinpath(RESULTS_DIR, "sweep_best_g_functions.pdf"), fig5; px_per_unit = 600/72)
 
 # ══════════════════════════════════════════════════════════
-# 7. Loss curves for the best run per config
-#
-# Loaded from /diagnostics in the master HDF5. Shows both
-# stages of training with a vertical line at the stage boundary.
+# 7. Loss curves for the Pareto-best run per config
 # ══════════════════════════════════════════════════════════
 
 fig6 = Figure(size = (1200, 400), fontsize = 12)
 
 for (col, cfg) in enumerate(config_keys)
-    sub = sort(filter(r -> r.config == cfg, df), :ode_mse)
-    best = first(sub)
+    sub = filter(r -> r.config == cfg, df)
+    best = select_pareto_best(sub)
     run_label = "$(best.config)_hp$(best.hp_idx)"
 
-    # Read loss trajectory from the master HDF5
     has_diag, iters, d_mse_hist, o_mse_hist = h5open(MASTER_H5, "r") do fid
         diag_path = "diagnostics/$run_label"
         if !haskey(fid, diag_path)
@@ -461,7 +724,7 @@ for (col, cfg) in enumerate(config_keys)
     end
 
     ax = Makie.Axis(fig6[1, col];
-        title  = "$cfg — best run (hp$(best.hp_idx))",
+        title  = "$cfg — Pareto-best (hp$(best.hp_idx))",
         xlabel = "Iteration",
         ylabel = col == 1 ? "Loss" : "",
         yscale = Makie.log10,
@@ -472,14 +735,11 @@ for (col, cfg) in enumerate(config_keys)
     )
 
     if !has_diag
-        # No diagnostics recorded — show a placeholder note
         text!(ax, 0.5, 0.5; text = "No diagnostics", align = (:center, :center),
               space = :relative, fontsize = 10)
         continue
     end
 
-    # Stage 1 → Stage 2 boundary (vertical marker)
-    # Stage 1 iters are identifiable as those where ode_mse is NaN
     stage2_start = let idx = findfirst(!isnan, o_mse_hist)
         isnothing(idx) ? nothing : iters[idx]
     end
@@ -487,11 +747,9 @@ for (col, cfg) in enumerate(config_keys)
         vlines!(ax, [stage2_start]; color = :grey50, linestyle = :dash, linewidth = 1)
     end
 
-    # Data MSE (present across both stages)
     lines!(ax, iters, d_mse_hist;
         color = :royalblue, linewidth = 1.5, label = "Data MSE")
 
-    # ODE MSE (Stage 2 only — filter NaN from Stage 1)
     ode_mask = .!isnan.(o_mse_hist)
     if any(ode_mask)
         lines!(ax, iters[ode_mask], o_mse_hist[ode_mask];
@@ -502,39 +760,40 @@ for (col, cfg) in enumerate(config_keys)
 end
 
 Label(fig6[0, 1:length(config_keys)],
-    "Training loss curves — best run per config";
+    "Training loss curves — Pareto-best run per config";
     fontsize = 14, tellwidth = false)
 
 save(joinpath(RESULTS_DIR, "sweep_best_loss_curves.pdf"), fig6; px_per_unit = 600/72)
 
 # ══════════════════════════════════════════════════════════
-# 8. Ranked table (stdout)
+# 8. Ranked table — Pareto-optimal runs, sorted by
+#    utopia distance in log₁₀ space
 # ══════════════════════════════════════════════════════════
 
-println("="^90)
-println("  Top 5 runs per configuration (sorted by ODE MSE)")
-println("="^90)
+println("="^100)
+println("  Top 5 Pareto-optimal runs per configuration (sorted by nadir distance, descending)")
+println("="^100)
 
 for cfg in config_keys
-    sub = sort(filter(r -> r.config == cfg, df), :ode_mse)
-    top = first(sub, min(5, nrow(sub)))
+    sub = filter(r -> r.config == cfg, df)
+    top = select_pareto_top(sub, 5)
 
-    println("\n── $cfg ──")
-    @printf("  %-6s  %-10s  %-10s  %-8s  %-8s  %-8s  %-10s  %-10s  %-10s\n",
-            "hp_idx", "ode_mse", "data_mse", "ϵ_ode", "ϵ_Data", "ϵ_ic",
+    println("\n── $cfg  ($(sum(pareto_front_mask(sub.data_mse, sub.ode_mse))) Pareto-optimal of $(nrow(sub))) ──")
+    @printf("  %-6s  %-10s  %-10s  %-10s  %-8s  %-8s  %-8s  %-10s  %-10s  %-10s\n",
+            "hp_idx", "nadir_d", "ode_mse", "data_mse", "ϵ_ode", "ϵ_Data", "ϵ_ic",
             "β_rec", "δ_rec", "c_rec")
-    println("  ", "-"^84)
+    println("  ", "-"^96)
     for r in eachrow(top)
-        @printf("  %-6d  %.3e  %.3e  %-8.3f  %-8.3f  %-8.3f  %.2e  %8.3f  %8.3f\n",
-                r.hp_idx, r.ode_mse, r.data_mse, r.ϵ_ode, r.ϵ_Data, r.ϵ_ic,
+        @printf("  %-6d  %.3e  %.3e  %.3e  %-8.3f  %-8.3f  %-8.3f  %.2e  %8.3f  %8.3f\n",
+                r.hp_idx, r.nadir_dist, r.ode_mse, r.data_mse, r.ϵ_ode, r.ϵ_Data, r.ϵ_ic,
                 r.β_recovered, r.δ_recovered, r.c_recovered)
     end
 end
 
 println("\nAll plots saved to $RESULTS_DIR")
-println("  sweep_pareto.pdf            — Data vs ODE loss Pareto fronts")
-println("  sweep_param_recovery.pdf    — Recovered β, δ, c for top runs")
-println("  sweep_sensitivity.pdf       — HP sensitivity heatmaps")
-println("  sweep_best_trajectories.pdf — State fits from best run per config")
-println("  sweep_best_g_functions.pdf  — Learned g_T, g_V from best runs")
-println("  sweep_best_loss_curves.pdf  — Training loss curves from best runs")
+println("  sweep_pareto.pdf                        — Data vs ODE loss Pareto fronts")
+println("  sweep_param_recovery.pdf                — Recovered β, δ, c for Pareto-optimal runs")
+println("  sweep_sensitivity_triangle_<cfg>.pdf    — Full pairwise ϵ triangle heatmaps")
+println("  sweep_best_trajectories.pdf             — State fits from Pareto-best run per config")
+println("  sweep_best_g_functions.pdf              — Learned g_T, g_V from Pareto-best runs")
+println("  sweep_best_loss_curves.pdf              — Training loss curves from Pareto-best runs")
