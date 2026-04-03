@@ -7,6 +7,20 @@ using ForwardDiff
 using Statistics
 using Random
 
+#================================================================================
+
+Since we essentially have the same training procedure but for different flags,
+we can use julia's multiple dispatch to make the code lean and simpler
+
+================================================================================#
+
+
+abstract type AbstractHyperMode end
+struct FixedHyper <: AbstractHyperMode end
+struct AdaptiveHyper <: AbstractHyperMode end
+
+
+
 dist_outside(x, lower, upper) = sum(@. max(0f0, lower - x) + max(0f0, x - upper))
 
 # MSE(ŷ, y) = Statistics.mean(abs2, vec(ŷ .- y))
@@ -133,91 +147,172 @@ function loss_ODE(
 end
 
 
-function self_adaptive_supervised_loss(ps, ctx::PINNCtxStage1)
+# function self_adaptive_supervised_loss(ps, ctx::PINNCtxStage1)
 
-    hyperparams = ps.hyper
+#     hyperparams = ps.hyper
    
-    ϵ_ic_sq        = exp(2f0 * hyperparams.log_ϵ_ic)       + 1f-6
-    ϵ_Data_sq      = exp(2f0 * hyperparams.log_ϵ_Data)     + 1f-6
-    ϵ_L1_state_sq  = exp(2f0 * hyperparams.log_ϵ_L1_state) + 1f-6
+#     ϵ_ic_sq        = exp(2f0 * hyperparams.log_ϵ_ic)       + 1f-6
+#     ϵ_Data_sq      = exp(2f0 * hyperparams.log_ϵ_Data)     + 1f-6
+#     ϵ_L1_state_sq  = exp(2f0 * hyperparams.log_ϵ_L1_state) + 1f-6
 
-    hyper_loss = 2f0 * hyperparams.log_ϵ_ic +
-        2f0 * hyperparams.log_ϵ_Data +
-        2f0 * hyperparams.log_ϵ_L1_state
+#     hyper_loss = 2f0 * hyperparams.log_ϵ_ic +
+#         2f0 * hyperparams.log_ϵ_Data +
+#         2f0 * hyperparams.log_ϵ_L1_state
 
-    return 0.5 * (
-        loss_IC(ps, ctx) / ϵ_ic_sq +
-        loss_Data(ps, ctx) / ϵ_Data_sq +
-        l1_penalty_state(ps) / ϵ_L1_state_sq + 
-        hyper_loss
-    )
+#     return 0.5 * (
+#         loss_IC(ps, ctx) / ϵ_ic_sq +
+#         loss_Data(ps, ctx) / ϵ_Data_sq +
+#         l1_penalty_state(ps) / ϵ_L1_state_sq + 
+#         hyper_loss
+#     )
+# end
+
+# function self_adaptive_unsupervised_loss(ps, ctx::PINNCtxStage2,
+#                                          architecture::Function,
+#                                          ODE_param_constructor
+#                                          )
+
+#     hyperparams = ps.hyper
+    
+#     ϵ_ic_sq       = exp(2f0 * hyperparams.log_ϵ_ic)       + 1f-6
+#     ϵ_Data_sq     = exp(2f0 * hyperparams.log_ϵ_Data)     + 1f-6
+#     ϵ_ode_sq      = exp(2f0 * hyperparams.log_ϵ_ode)      + 1f-6
+#     ϵ_L1_state_sq = exp(2f0 * hyperparams.log_ϵ_L1_state) + 1f-6
+#     ϵ_L1_g_sq     = exp(2f0 * hyperparams.log_ϵ_L1_g)     + 1f-6
+
+#     hyper_loss = 2f0 * hyperparams.log_ϵ_ic +
+#         2f0 * hyperparams.log_ϵ_Data +
+#         2f0 * hyperparams.log_ϵ_ode +
+#         2f0 * hyperparams.log_ϵ_L1_state +
+#         2f0 * hyperparams.log_ϵ_L1_g
+    
+#     return 0.5 * (
+#         loss_IC(ps, ctx) / ϵ_ic_sq +
+#         loss_Data(ps, ctx) / ϵ_Data_sq +
+#         loss_ODE(ps, ctx, architecture, ODE_param_constructor) / ϵ_ode_sq +
+#         l1_penalty_state(ps) / ϵ_L1_state_sq +
+#         l1_penalty_g(ps) / ϵ_L1_g_sq +
+#         hyper_loss +
+#         param_bound_penalty(ps, ctx)
+#     )
+# end
+
+# function fixed_supervised_loss(ps, ctx::PINNCtxStage1)
+#     ϵ_ic_sq       = ctx.ϵ_ic^2 + 1f-6
+#     ϵ_Data_sq     = ctx.ϵ_Data^2 + 1f-6
+#     ϵ_L1_state_sq = ctx.ϵ_L1_state^2 + 1f-6
+
+#     return 0.5f0 * (
+#         loss_IC(ps, ctx) / ϵ_ic_sq +
+#         loss_Data(ps, ctx) / ϵ_Data_sq +
+#         l1_penalty_state(ps) / ϵ_L1_state_sq
+#     )
+# end
+
+# function fixed_unsupervised_loss(ps, ctx::PINNCtxStage2,
+#                                  architecture::Function,
+#                                  ODE_param_constructor)
+
+#     ϵ_ic_sq       = ctx.ϵ_ic^2 + 1f-6
+#     ϵ_Data_sq     = ctx.ϵ_Data^2 + 1f-6
+#     ϵ_ode_sq      = ctx.ϵ_ode^2 + 1f-6
+#     ϵ_L1_state_sq = ctx.ϵ_L1_state^2 + 1f-6
+#     ϵ_L1_g_sq     = ctx.ϵ_L1_g^2 + 1f-6
+
+#     L_ic      = loss_IC(ps, ctx)
+#     L_data    = loss_Data(ps, ctx)
+#     L_ode     = loss_ODE(ps, ctx, architecture, ODE_param_constructor)
+#     L_L1s     = l1_penalty_state(ps)
+#     L_L1g     = l1_penalty_g(ps)
+#     L_bnd     = param_bound_penalty(ps, ctx)
+
+#     return 0.5f0 * (
+#         L_ic   / ϵ_ic_sq +
+#         L_data / ϵ_Data_sq +
+#         L_ode  / ϵ_ode_sq +
+#         L_L1s  / ϵ_L1_state_sq +
+#         L_L1g  / ϵ_L1_g_sq +
+#         L_bnd
+#     )
+# end
+
+function resolve_epsilons(ps, ctx, ::FixedHyper)
+    (ϵ_ic = ctx.ϵ_ic,
+     ϵ_Data = ctx.ϵ_Data,
+     # ϵ_ode = ctx.ϵ_ode,
+     ϵ_L1_state = ctx.ϵ_L1_state,
+     # ϵ_L1_g = ctx.ϵ_L1_g
+     ) 
 end
 
-function self_adaptive_unsupervised_loss(ps, ctx::PINNCtxStage2,
-                                         architecture::Function,
-                                         ODE_param_constructor
-                                         )
-
-    hyperparams = ps.hyper
-    
-    ϵ_ic_sq       = exp(2f0 * hyperparams.log_ϵ_ic)       + 1f-6
-    ϵ_Data_sq     = exp(2f0 * hyperparams.log_ϵ_Data)     + 1f-6
-    ϵ_ode_sq      = exp(2f0 * hyperparams.log_ϵ_ode)      + 1f-6
-    ϵ_L1_state_sq = exp(2f0 * hyperparams.log_ϵ_L1_state) + 1f-6
-    ϵ_L1_g_sq     = exp(2f0 * hyperparams.log_ϵ_L1_g)     + 1f-6
-
-    hyper_loss = 2f0 * hyperparams.log_ϵ_ic +
-        2f0 * hyperparams.log_ϵ_Data +
-        2f0 * hyperparams.log_ϵ_ode +
-        2f0 * hyperparams.log_ϵ_L1_state +
-        2f0 * hyperparams.log_ϵ_L1_g
-    
-    return 0.5 * (
-        loss_IC(ps, ctx) / ϵ_ic_sq +
-        loss_Data(ps, ctx) / ϵ_Data_sq +
-        loss_ODE(ps, ctx, architecture, ODE_param_constructor) / ϵ_ode_sq +
-        l1_penalty_state(ps) / ϵ_L1_state_sq +
-        l1_penalty_g(ps) / ϵ_L1_g_sq +
-        hyper_loss +
-        param_bound_penalty(ps, ctx)
-    )
+function resolve_epsilons(ps, ctx, ::AdaptiveHyper)
+    hyperparams = ps.hyper 
+  
+    (ϵ_ic       = exp(hyperparams.log_ϵ_ic),
+     ϵ_Data     = exp(hyperparams.log_ϵ_Data),
+     ϵ_ode      = exp(hyperparams.log_ϵ_ode),
+     ϵ_L1_state = exp(hyperparams.log_ϵ_L1_state),
+     ϵ_L1_g     = exp(hyperparams.log_ϵ_L1_g)) 
 end
 
-function fixed_supervised_loss(ps, ctx::PINNCtxStage1)
-    ϵ_ic_sq       = ctx.ϵ_ic^2 + 1f-6
-    ϵ_Data_sq     = ctx.ϵ_Data^2 + 1f-6
-    ϵ_L1_state_sq = ctx.ϵ_L1_state^2 + 1f-6
+# Adds a penalty punishing exteme ϵ values for adaptive loss. 0 for fixed.
+hyper_penalty(ps, ::FixedHyper) = 0f0
+
+function hyper_penalty(ps, ::AdaptiveHyper)
+    hp = ps.hyper
+    2f0 * (h.log_ϵ_ic + h.log_ϵ_ode + h.log_ϵ_Data + h.log_ϵ_L1_state + h.log_ϵ_L1_g)
+end 
+
+function supervised_loss(
+    ps,
+    ctx,
+    mode::AbstractHyperMode
+    )
+
+    hp = resolve_epsilons(ps, ctx, mode)
+
+    penalty = hyper_penalty(ps, mode)
 
     return 0.5f0 * (
-        loss_IC(ps, ctx) / ϵ_ic_sq +
-        loss_Data(ps, ctx) / ϵ_Data_sq +
-        l1_penalty_state(ps) / ϵ_L1_state_sq
+        loss_IC(ps, ctx)        / (hp.ϵ_ic^2 + 1f-6) +
+        loss_Data(ps, ctx)      / (hp.ϵ_Data^2 + 1f-6) +
+        l1_penalty_state(ps)    / (hp.ϵ_L1_state^2 + 1f-6) +
+        penalty
     )
 end
 
-function fixed_unsupervised_loss(ps, ctx::PINNCtxStage2,
-                                 architecture::Function,
-                                 ODE_param_constructor)
+function unsupervised_loss(ps,
+                           ctx,
+                           mode::AbstractHyperMode,
+                           architecture,
+                           ode_param_constructor)
+    hp = resolve_epsilons(ps, ctx, mode)
 
-    ϵ_ic_sq       = ctx.ϵ_ic^2 + 1f-6
-    ϵ_Data_sq     = ctx.ϵ_Data^2 + 1f-6
-    ϵ_ode_sq      = ctx.ϵ_ode^2 + 1f-6
-    ϵ_L1_state_sq = ctx.ϵ_L1_state^2 + 1f-6
-    ϵ_L1_g_sq     = ctx.ϵ_L1_g^2 + 1f-6
-
-    L_ic      = loss_IC(ps, ctx)
-    L_data    = loss_Data(ps, ctx)
-    L_ode     = loss_ODE(ps, ctx, architecture, ODE_param_constructor)
-    L_L1s     = l1_penalty_state(ps)
-    L_L1g     = l1_penalty_g(ps)
-    L_bnd     = param_bound_penalty(ps, ctx)
+    penalty = hyper_penalty(ps, mode)
 
     return 0.5f0 * (
-        L_ic   / ϵ_ic_sq +
-        L_data / ϵ_Data_sq +
-        L_ode  / ϵ_ode_sq +
-        L_L1s  / ϵ_L1_state_sq +
-        L_L1g  / ϵ_L1_g_sq +
-        L_bnd
-    )
+        loss_IC(ps, ctx)                / (hp.ϵ_ic^2 + 1f-6) +
+        loss_Data(ps, ctx)              / (hp.ϵ_Data^2 + 1f-6) +
+        l1_penalty_state(ps)            / (hp.ϵ_L1_state^2 + 1f-6) +
+        loss_ODE(ps,
+                 ctx,
+                 architecture,
+                 ODE_param_constructor) / (hp.ϵ_ode^2 + 1f-6) +
+        l1_penalty_g(ps)                / (hp.ϵ_L1_g^2 + 1f-6) +
+        penalty
+    )    
 end
+
+
+
+    
+
+    
+    
+
+    
+
+    
+    
+    
+    
