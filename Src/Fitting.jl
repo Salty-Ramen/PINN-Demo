@@ -111,19 +111,34 @@ function make_optfun(loss)
     )
 end
 
-function initialize_components(rng, data, hp::HyperParams, build_state_mlp::Function, build_g_mlp::Function)
-    # 2a. Build networks
-    State_MLP = build_state_mlp()
-    ps_StateMLP, st_StateMLP = Lux.setup(rng, State_MLP)
 
-    g_MLP = build_g_mlp()
-    ps_gMLP, st_gMLP = Lux.setup(rng, g_MLP)
+function build_trainables(
+    ::FixedHyper,
+    ps_state,
+    ps_g,
+    ode_par_init,
+    hp::HyperParams
+    )
 
-    # 2b. Initial ODE parameters (NamedTuple)
-    trainable_params = ComponentArrays.ComponentArray(
-        StateMLP = ps_StateMLP,
-        gMLP     = ps_gMLP,
-        ODE_par  = data.ODE_par_init,
+    return ComponentArrays.ComponentArray(
+        StateMLP = ps_state,
+        gMLP = ps_g,
+        ODE_par = ode_par_init
+    )
+end
+
+function build_trainables(
+    ::AdaptiveHyper,
+    ps_state,
+    ps_g,
+    ode_par_init,
+    hp::HyperParams      
+    )
+
+    return ComponentArrays.ComponentArray(
+        StateMLP = ps_state,
+        gMLP     = ps_g,
+        ODE_par  = ode_par_init,
         # log space search might be better conditioned
         hyper = (
             log_ϵ_ic       = log(hp.ϵ_ic),
@@ -133,6 +148,24 @@ function initialize_components(rng, data, hp::HyperParams, build_state_mlp::Func
             log_ϵ_L1_g     = log(hp.ϵ_L1_g)
         )
     )
+end
+
+function initialize_components(
+    mode::AbstractHyperMode,
+    rng,
+    data,
+    hp::HyperParams,
+    build_state_mlp::Function,
+    build_g_mlp::Function
+    )
+ 
+    State_MLP = build_state_mlp()
+    ps_StateMLP, st_StateMLP = Lux.setup(rng, State_MLP)
+
+    g_MLP = build_g_mlp()
+    ps_gMLP, st_gMLP = Lux.setup(rng, g_MLP)
+
+    trainable_params = build_trainables(mode, ps_StateMLP, ps_gMLP, data.ODE_par_init, hp)
 
     return State_MLP, st_StateMLP, g_MLP, st_gMLP, trainable_params
 end
@@ -201,9 +234,14 @@ function run_stage1(initial_params,
                     Opt_alg_stage1,
                     maxiters_stage1,
                     default_supervised_loss,
-                    callback_function)
+                    callback_function,
+                    mode::AbstractHyperMode)
+    
     println("########## Starting Stage 1: Supervised Training ##########")
-    optfun1 = make_optfun(default_supervised_loss)
+
+    loss_closure(ps, ctx) = default_supervised_loss(ps, ctx, mode)
+    optfun1 = make_optfun(loss_closure)
+    
     prob1   = Optimization.OptimizationProblem(optfun1, initial_params, ctx_stage1)
 
     res1    = Optimization.solve(
@@ -225,12 +263,15 @@ function run_stage2(
     ode_param_constructor, 
     user_loss_functions::AbstractVector{<:Function}, 
     callback_function::Function, 
-    default_unsupervised_loss
-)
+    default_unsupervised_loss,
+    mode::AbstractHyperMode)
+    
     println("########## Starting Stage 2: ODE-Regularized Training ##########")
 
     # Define the core unsupervised loss closure (used for ODE and L1 regularization)
-    loss_closure(ps, ctx) = default_unsupervised_loss(ps, ctx, architecture, ode_param_constructor)
+    loss_closure(ps, ctx) = default_unsupervised_loss(ps, ctx,
+                                                      mode, architecture,
+                                                      ode_param_constructor)
 
     # Define the combined loss, including user-defined losses
     loss_combined(ps, ctx) = begin
@@ -295,7 +336,8 @@ function rebuild_ctx_stage2(ctx::PINNCtxStage2, frozen_scale::AbstractMatrix)
     )
 end
 
-function train_once(
+function train(
+    mode::AbstractHyperMode,
     data,
     architecture::Function,
     ode_param_constructor,
@@ -310,15 +352,15 @@ function train_once(
     callback_function::Function= callback_function_default,
     Opt_alg_stage1 =  OptimizationOptimisers.Adam(1f-3),
     Opt_alg_stage2 = OptimizationOptimJL.LBFGS(m = 25),
-    default_supervised_loss = self_adaptive_supervised_loss,
-    default_unsupervised_loss = self_adaptive_unsupervised_loss
+    default_supervised_loss = supervised_loss,
+    default_unsupervised_loss = unsupervised_loss
     )
 
     rng = MersenneTwister(seed)
     
     # 1. Initialization and Parameter Assembly
     State_MLP, st_StateMLP, g_MLP, st_gMLP, initial_params = initialize_components(
-        rng, data, hp, build_state_mlp, build_g_mlp
+        mode, rng, data, hp, build_state_mlp, build_g_mlp
     )
 
     # 2. Context Building
@@ -327,24 +369,25 @@ function train_once(
     )
     
     # 3. Stage 1: Supervised Training
-    trainable_params_stage1 = run_stage1(
+    trainable_params_post_stage1 = run_stage1(
         initial_params, 
         ctx_stage1, 
         Opt_alg_stage1, 
         maxiters_stage1, 
         default_supervised_loss,
-        callback_function
+        callback_function,
+        mode
     )
 
     # Freeze the derivative scale from the Stage 1 network
-    frozen_scale = compute_frozen_ode_scale(trainable_params_stage1, ctx_stage2)
+    frozen_scale = compute_frozen_ode_scale(trainable_params_post_stage1, ctx_stage2)
 
     # Rebuild ctx with the correct normalization (structs are immutable)
     ctx_stage2 = rebuild_ctx_stage2(ctx_stage2, frozen_scale)
 
     # 4. Stage 2: ODE-regularized Training
     ps_trained = run_stage2(
-        trainable_params_stage1, 
+        trainable_params_post_stage1, 
         ctx_stage2, 
         Opt_alg_stage2, 
         maxiters_stage2, 
@@ -352,7 +395,8 @@ function train_once(
         ode_param_constructor, 
         user_loss_functions, 
         callback_function, 
-        default_unsupervised_loss
+        default_unsupervised_loss,
+        mode
     )
 
     # 5. Metrics and Return
@@ -368,27 +412,6 @@ function train_once(
 end
 
 ########## FIXED HYPERPARAM TRAINING ##########
-    
-function initialize_components_fixed(rng, data, hp::HyperParams,
-                                     build_state_mlp::Function,
-                                     build_g_mlp::Function)
-    # 1. Build networks
-    State_MLP = build_state_mlp()
-    ps_StateMLP, st_StateMLP = Lux.setup(rng, State_MLP)
-
-    g_MLP = build_g_mlp()
-    ps_gMLP, st_gMLP = Lux.setup(rng, g_MLP)
-
-    # 2. Initial ODE parameters (NamedTuple)
-    # Note: `hyper` is EXCLUDED here compared to the standard train_once
-    trainable_params = ComponentArrays.ComponentArray(
-        StateMLP = ps_StateMLP,
-        gMLP     = ps_gMLP,
-        ODE_par  = data.ODE_par_init
-    )
-
-    return State_MLP, st_StateMLP, g_MLP, st_gMLP, trainable_params
-end
 
 function train_fixed_hyper(
     data,
