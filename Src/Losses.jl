@@ -236,30 +236,47 @@ end
 #     )
 # end
 
-function resolve_epsilons(ps, ctx, ::FixedHyper)
+function resolve_epsilons(ps, ctx::PINNCtxStage1, ::FixedHyper)
     (ϵ_ic = ctx.ϵ_ic,
      ϵ_Data = ctx.ϵ_Data,
-     # ϵ_ode = ctx.ϵ_ode,
-     ϵ_L1_state = ctx.ϵ_L1_state,
-     # ϵ_L1_g = ctx.ϵ_L1_g
+     ϵ_L1_state = ctx.ϵ_L1_state
      ) 
 end
 
-function resolve_epsilons(ps, ctx, ::AdaptiveHyper)
+function resolve_epsilons(ps, ctx::PINNCtxStage2, ::FixedHyper)
+    (ϵ_ic = ctx.ϵ_ic,
+     ϵ_Data = ctx.ϵ_Data,
+     ϵ_ode = ctx.ϵ_ode,
+     ϵ_L1_state = ctx.ϵ_L1_state,
+     ϵ_L1_g = ctx.ϵ_L1_g
+     ) 
+end
+
+function resolve_epsilons(ps, ctx::PINNCtxStage1, ::AdaptiveHyper)
+    hyperparams = ps.hyper 
+  
+    (ϵ_ic       = exp(hyperparams.log_ϵ_ic),
+     ϵ_Data     = exp(hyperparams.log_ϵ_Data),
+     ϵ_L1_state = exp(hyperparams.log_ϵ_L1_state)
+     ) 
+end
+
+function resolve_epsilons(ps, ctx ::PINNCtxStage2, ::AdaptiveHyper)
     hyperparams = ps.hyper 
   
     (ϵ_ic       = exp(hyperparams.log_ϵ_ic),
      ϵ_Data     = exp(hyperparams.log_ϵ_Data),
      ϵ_ode      = exp(hyperparams.log_ϵ_ode),
      ϵ_L1_state = exp(hyperparams.log_ϵ_L1_state),
-     ϵ_L1_g     = exp(hyperparams.log_ϵ_L1_g)) 
+     ϵ_L1_g     = exp(hyperparams.log_ϵ_L1_g)
+     ) 
 end
 
 # Adds a penalty punishing exteme ϵ values for adaptive loss. 0 for fixed.
 hyper_penalty(ps, ::FixedHyper) = 0f0
 
 function hyper_penalty(ps, ::AdaptiveHyper)
-    hp = ps.hyper
+    h = ps.hyper
     2f0 * (h.log_ϵ_ic + h.log_ϵ_ode + h.log_ϵ_Data + h.log_ϵ_L1_state + h.log_ϵ_L1_g)
 end 
 
@@ -297,7 +314,7 @@ function unsupervised_loss(ps,
         loss_ODE(ps,
                  ctx,
                  architecture,
-                 ODE_param_constructor) / (hp.ϵ_ode^2 + 1f-6) +
+                 ode_param_constructor) / (hp.ϵ_ode^2 + 1f-6) +
         l1_penalty_g(ps)                / (hp.ϵ_L1_g^2 + 1f-6) +
         penalty
     )    
