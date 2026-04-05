@@ -10,11 +10,18 @@ using Random
 #================================================================================
 
 Since we essentially have the same training procedure but for different flags,
-we can use julia's multiple dispatch to make the code lean and simpler
+we can use julia's multiple dispatch to make the code lean and simple.
 
 ================================================================================#
 
 
+#=-------------------------------------------------------------------------------
+
+We now define the following modes for hyperparameter parametrization: Fixed and
+Adaptive. Fixed is the default recommendation for now since adaptive lowkey
+doesn't work.
+
+-------------------------------------------------------------------------------=#
 abstract type AbstractHyperMode end
 struct FixedHyper <: AbstractHyperMode end
 struct AdaptiveHyper <: AbstractHyperMode end
