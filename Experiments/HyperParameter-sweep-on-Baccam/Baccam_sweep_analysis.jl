@@ -198,7 +198,12 @@ end
 
 # Keep only converged runs with finite losses for plotting
 df = filter(r -> r.converged && isfinite(r.data_mse) && isfinite(r.ode_mse), df_all)
-println("$(nrow(df)) converged runs with finite losses (of $(nrow(df_all)) total).\n")
+println("$(nrow(df)) converged runs with finite losses (of $(nrow(df_all)) total).")
+
+# Remove outlier runs where either objective exceeds 1.0 — these are
+# uninformative for analysis and distort normalisation in nadir scoring.
+df = filter(r -> r.data_mse < 1.0 && r.ode_mse < 1.0, df)
+println("$(nrow(df)) runs remaining after quality filter (both data_mse < 1 and ode_mse < 1).\n")
 
 # ══════════════════════════════════════════════════════════
 # Utility: Pareto front mask (minimize both objectives)
@@ -242,9 +247,11 @@ end
 Score each run by its distance from the nadir (worst) point in
 min-max normalised objective space. Higher score = better compromise.
 
-Each axis is min-max scaled to [0, 1] in raw (linear) space.
-The nadir is (1, 1). The returned score is the Euclidean distance
-from (1, 1), so larger = better.
+Uses linear (raw) space since outlier runs have been removed by the
+global quality filter, so min-max normalisation is well-conditioned.
+
+Each axis is min-max scaled to [0, 1]. The nadir is (1, 1). The
+returned score is the Euclidean distance from (1, 1), so larger = better.
 """
 function _nadir_scores(data_mse, ode_mse)
     d = Float64.(data_mse)
@@ -253,11 +260,9 @@ function _nadir_scores(data_mse, ode_mse)
     d_range = max(maximum(d) - minimum(d), 1e-12)
     o_range = max(maximum(o) - minimum(o), 1e-12)
 
-    # Normalise to [0, 1] where 0 = best, 1 = worst on each axis
     d_norm = (d .- minimum(d)) ./ d_range
     o_norm = (o .- minimum(o)) ./ o_range
 
-    # Distance from nadir (1, 1) — larger means farther from worst
     return sqrt.((1.0 .- d_norm) .^ 2 .+ (1.0 .- o_norm) .^ 2)
 end
 
@@ -266,9 +271,9 @@ end
 
 From a per-config subset `sub`, identify the Pareto front in
 (data_mse, ode_mse) space, then return the point farthest from
-the nadir (1, 1) in log₁₀-normalised coordinates. This selects
-the "elbow" of convex fronts where neither objective is sacrificed.
+the nadir (1, 1) in log₁₀-normalised coordinates.
 
+Assumes `sub` has already been quality-filtered globally.
 Falls back to the single Pareto point if the front is degenerate.
 """
 function select_pareto_best(sub::DataFrame)
@@ -278,7 +283,6 @@ function select_pareto_best(sub::DataFrame)
     nrow(pareto_sub) <= 1 && return first(eachrow(pareto_sub))
 
     scores = _nadir_scores(pareto_sub.data_mse, pareto_sub.ode_mse)
-    # Maximize distance from nadir → best compromise
     return pareto_sub[argmax(scores), :]
 end
 
@@ -288,8 +292,7 @@ end
 Return up to `n` Pareto-optimal runs from `sub`, sorted by
 nadir distance (descending — best compromise first).
 
-The `nadir_dist` column is added so downstream code can use it
-for colouring and ranking.
+Assumes `sub` has already been quality-filtered globally.
 """
 function select_pareto_top(sub::DataFrame, n::Int)
     mask = pareto_front_mask(sub.data_mse, sub.ode_mse)
@@ -301,7 +304,6 @@ function select_pareto_top(sub::DataFrame, n::Int)
     end
 
     pareto_sub.nadir_dist = _nadir_scores(pareto_sub.data_mse, pareto_sub.ode_mse)
-    # Sort descending: highest nadir distance = best elbow compromise
     sorted = sort(pareto_sub, :nadir_dist; rev = true)
     return first(sorted, min(n, nrow(sorted)))
 end
