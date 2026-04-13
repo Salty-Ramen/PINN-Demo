@@ -20,17 +20,6 @@ Utilities
 
 using Optimization, OptimizationOptimisers, OptimizationOptimJL
 
-"""
-A results container struct containing ... results.
-"""
-struct TrainResult{PS,CTX,M1,M2}
-    hyper    :: HyperParams
-    params   :: PS
-    ctx2     :: CTX
-    state_mlp:: M1
-    g_mlp    :: M2
-    metrics  :: NamedTuple
-end
 
 """
 A hyperparam container struct containing ... hyperparams.
@@ -41,6 +30,18 @@ struct HyperParams
     ϵ_Data      :: Float32
     ϵ_L1_state  :: Float32
     ϵ_L1_g      :: Float32
+end
+
+"""
+A results container struct containing ... results.
+"""
+struct TrainResult{PS,CTX,M1,M2}
+    hyper    :: HyperParams
+    params   :: PS
+    ctx2     :: CTX
+    state_mlp:: M1
+    g_mlp    :: M2
+    metrics  :: NamedTuple
 end
 
 """
@@ -166,6 +167,7 @@ the optimizer updates.
 -------------------------------------------------------------------------------=#
 
 using ComponentArrays
+include("Losses.jl")
 
 """
     build_trainables(mode, ps_state, ps_g, ode_par_init, hp)
@@ -211,7 +213,8 @@ Transforms raw data, builds predictor closures via
 Stage 1 / Stage 2 context structs.
 
 -------------------------------------------------------------------------------=#
-    
+include("Predictors.jl")
+include("Transforms.jl")
 
 # Checks the data tuple for raw data/IC and returns accordingly
 raw_training_targets(data) = hasproperty(data, :Y_train_raw) ? data.Y_train_raw : data.Y_train
@@ -443,7 +446,7 @@ function train(
         initialize_components(arch_mode, rng, data, build_state_mlp, build_g_mlp)
 
     # 2. Append hyper entries if adaptive, then wrap in ComponentArray
-    initial_params = build_trainables(mode, raw_ps, hp)
+    initial_params = build_trainables(mode, raw_ps.StateMLP, raw_ps.gMLP, raw_ps.ODE_par, hp)
 
     # 3. Build training contexts (applies transform, creates predictor closures)
     ctx_stage1, ctx_stage2 = build_contexts(
