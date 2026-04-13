@@ -102,9 +102,10 @@ observed IC.  Should be skipped when the IC is structurally
 enforced (hard-wired into the state predictor).
 """
 function loss_IC(ps, ctx)
-    ŷ =  ctx.predict_state(ps, ctx.t_train)
+    # fill(...) returns a 1x1 matrix without tripping Zygote up.
+    ŷ0 =  ctx.predict_state(ps, fill(0f0, 1, 1))
     denom = max.(abs.(ctx.y0_obs), 1f-06)
-    return MSE(ŷ, ctx.y0_obs, denom)
+    return MSE(ŷ0, ctx.y0_obs, denom)
 end
 
 
