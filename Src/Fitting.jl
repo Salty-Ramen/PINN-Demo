@@ -1,15 +1,40 @@
-using ComponentArrays
-using Lux, NNlib
+#=-------------------------------------------------------------------------------
+Training.jl
+
+Orchestrates the two-stage PINN training pipeline:
+
+  Stage 1 — Supervised: fit the state network to training data
+  Stage 2 — ODE-regularised: add physics residual loss, train
+            g-network and recover ODE parameters
+
+This file handles parameter assembly, context construction,
+optimizer wiring, and the between-stages frozen-scale computation.
+Loss math lives in Losses.jl; predictor construction in Predictors.jl.
+-------------------------------------------------------------------------------=#
+
+#=-------------------------------------------------------------------------------
+
+Utilities
+
+-------------------------------------------------------------------------------=#
+
 using Optimization, OptimizationOptimisers, OptimizationOptimJL
-using Zygote
-# using Enzyme
-using ForwardDiff
-using Statistics
-using Random
-using Base.Threads
 
+"""
+A results container struct containing ... results.
+"""
+struct TrainResult{PS,CTX,M1,M2}
+    hyper    :: HyperParams
+    params   :: PS
+    ctx2     :: CTX
+    state_mlp:: M1
+    g_mlp    :: M2
+    metrics  :: NamedTuple
+end
 
-#--------Context Structs--------
+"""
+A hyperparam container struct containing ... hyperparams.
+"""
 struct HyperParams
     ϵ_ic        :: Float32
     ϵ_ode       :: Float32
@@ -18,31 +43,45 @@ struct HyperParams
     ϵ_L1_g      :: Float32
 end
 
-struct PINNCtxStage1{M,ST,T,Y,YS,V,TR}
-    State_MLP   :: M
-    st_StateMLP :: ST
-    t_train     :: T
-    Y_train     :: Y
-    Y_train_std :: YS
-    y0_obs      :: V
-    transform   :: TR
-    ϵ_ic        :: Float32
-    ϵ_Data      :: Float32
-    ϵ_L1_state  :: Float32
-    t_span      :: Vector{Float32}
+"""
+Stage 1 context: supervised data fitting.
+
+The predictor closures satisfy:
+  - `predict_state(ps, t_grid)` → (n_states × B) in transformed coords
+  - `predict_deriv(ps, t_grid)` → (n_states × B) time derivatives
+"""
+struct PINNCtxStage1{PS,PD,T,Y,YS,V,TR}
+    predict_state  :: PS
+    predict_deriv  :: PD
+    t_train        :: T
+    Y_train        :: Y
+    Y_train_std    :: YS
+    y0_obs         :: V
+    transform      :: TR
+    skip_ic_loss   :: Bool
+    ϵ_ic           :: Float32
+    ϵ_Data         :: Float32
+    ϵ_L1_state     :: Float32
+    t_span         :: Vector{Float32}
 end
 
-struct PINNCtxStage2{M,ST,GM,STG,T,Y,YS,GS,V,TD,TR}
-    State_MLP      :: M
-    st_StateMLP    :: ST
-    g_MLP          :: GM
-    st_gMLP        :: STG
+"""
+Stage 2 context: ODE-regularised training.
+
+Adds the g-predictor, dense collocation grid, ODE-specific
+epsilon, and parameter bounds on top of Stage 1 fields.
+"""
+struct PINNCtxStage2{PS,PD,PG,T,Y,YS,GS,V,TR,TD}
+    predict_state  :: PS
+    predict_deriv  :: PD
+    predict_g      :: PG
     t_train        :: T
     Y_train        :: Y
     Y_train_std    :: YS
     G_stage1_std   :: GS
     y0_obs         :: V
     transform      :: TR
+    skip_ic_loss   :: Bool
     ϵ_ic           :: Float32
     ϵ_Data         :: Float32
     ϵ_ode          :: Float32
@@ -53,57 +92,38 @@ struct PINNCtxStage2{M,ST,GM,STG,T,Y,YS,GS,V,TD,TR}
     ODE_par_bounds :: NamedTuple
 end
 
-include("Losses.jl")
-include("Transforms.jl")
- 
-struct TrainResult{PS,CTX,M1,M2}
-    hyper    :: HyperParams
-    params   :: PS
-    ctx2     :: CTX
-    state_mlp:: M1
-    g_mlp    :: M2
-    metrics  :: NamedTuple
+"""
+   compute_frozen_ode_scale(ps, ctx; min_scale=1f-6) -> Matrix{Float32}
+
+Since it was a bit awkward to decide on how the g NNs would be normalized, I
+think one way is by using the std of the derivative of post stage-1 state NN,
+since that would approximately be the dimensions where g would be.
+"""
+function compute_frozen_ode_scale(ps, ctx; min_scale::Float32 = 1f-06)
+    dYdt = ctx.predict_deriv(ps, ctx.t_dense)
+    scale = std(dYdt; dims = 2)
+    scale = max.(scale, min_scale)
+    return Float32.(Array(scale))
 end
 
-#--------Helpers--------
-
-
-state_model(ps, ctx) =
-    Lux.StatefulLuxLayer(ctx.State_MLP, ps.StateMLP, ctx.st_StateMLP)
-
-g_model(ps, ctx::PINNCtxStage2) =
-    Lux.StatefulLuxLayer(ctx.g_MLP, ps.gMLP, ctx.st_gMLP)
-
-
-function metrics_stage2(ps, ctx::PINNCtxStage2, architecture::Function, ODE_params)
-    smodel  = state_model(ps, ctx)
-    gmodel  = g_model(ps, ctx)
-    data_mse = MSE(smodel(ctx.t_train), ctx.Y_train, ctx.Y_train_std)
-
-    ODE_par = ODE_params(ps.ODE_par)
-    Tdense  = ctx.t_dense
-    dNNdt   = dNNdt_fd(smodel, vec(Tdense))
-    ẑ       = smodel(Tdense) 
-    f_ŷ     = transformed_rhs(ctx.transform, ẑ, gmodel(Tdense), ODE_par, architecture)
-    ode_mse = MSE(dNNdt, f_ŷ, ctx.G_stage1_std)
-
-    g_out   = gmodel(Tdense)
-    g_std   = std(vec(g_out))
-
-    return data_mse, ode_mse, g_std
-end
-
-# callback_function_default = (state, l) -> false 
-
+"""
+The default callback that just prints an iter count.
+"""
 function callback_function_default(state, l)
-    N = 25
-    if state.iter % (N*100) == 0
-        println("iteration =", state.iter)
+    if state.iter % 2500 == 0
+        println("iteration = ", state.iter)
     end
     return false
 end
 
 
+using Zygote
+# using Enzyme
+
+"""
+
+A wrapper/builder that makes an Optimization.jl style loss function
+"""
 function make_optfun(loss)
     Optimization.OptimizationFunction(
         (θ, p) -> loss(θ, p),
@@ -111,64 +131,87 @@ function make_optfun(loss)
     )
 end
 
+"""
+    extract_learned_hyper(ps) -> HyperParams
 
-function build_trainables(
-    ::FixedHyper,
-    ps_state,
-    ps_g,
-    ode_par_init,
-    hp::HyperParams
-    )
-
-    return ComponentArrays.ComponentArray(
-        StateMLP = ps_state,
-        gMLP = ps_g,
-        ODE_par = ode_par_init
-    )
+Recover the final ε values from the trained parameter vector.
+For adaptive mode, exponentiates the log-space values.
+For fixed mode, returns NaN placeholders.
+"""
+function extract_learned_hyper(ps)
+    if hasproperty(ps, :hyper)
+        h = ps.hyper
+        return HyperParams(
+            exp(h.log_ϵ_ic),
+            exp(h.log_ϵ_ode),
+            exp(h.log_ϵ_Data),
+            exp(h.log_ϵ_L1_state),
+            exp(h.log_ϵ_L1_g),
+        )
+    else
+        nan = NaN32
+        return HyperParams(nan, nan, nan, nan, nan)
+    end
 end
 
-function build_trainables(
-    ::AdaptiveHyper,
-    ps_state,
-    ps_g,
-    ode_par_init,
-    hp::HyperParams      
-    )
 
-    return ComponentArrays.ComponentArray(
+#=-------------------------------------------------------------------------------
+
+Parameter assembly
+
+Packs MLP weights, ODE parameters, and (for adaptive mode)
+log-space hyperparameters into a single ComponentArray that
+the optimizer updates.
+
+-------------------------------------------------------------------------------=#
+
+using ComponentArrays
+
+"""
+    build_trainables(mode, ps_state, ps_g, ode_par_init, hp)
+
+Assemble the flat trainable parameter vector. Fixed mode
+omits ε entries.
+"""
+function build_trainables(::FixedHyper, ps_state, ps_g, ode_par_init, hp::HyperParams)
+    ComponentArray(
         StateMLP = ps_state,
         gMLP     = ps_g,
         ODE_par  = ode_par_init,
-        # log space search might be better conditioned
-        hyper = (
+    )
+end
+
+"""
+    build_trainables(mode, ps_state, ps_g, ode_par_init, hp)
+
+Assemble the flat trainable parameter vector.  Adaptive mode
+adds log-space ε entries.
+"""
+function build_trainables(::AdaptiveHyper, ps_state, ps_g, ode_par_init, hp::HyperParams)
+    ComponentArray(
+        StateMLP = ps_state,
+        gMLP     = ps_g,
+        ODE_par  = ode_par_init,
+        hyper    = (
             log_ϵ_ic       = log(hp.ϵ_ic),
             log_ϵ_ode      = log(hp.ϵ_ode),
             log_ϵ_Data     = log(hp.ϵ_Data),
             log_ϵ_L1_state = log(hp.ϵ_L1_state),
-            log_ϵ_L1_g     = log(hp.ϵ_L1_g)
-        )
+            log_ϵ_L1_g     = log(hp.ϵ_L1_g),
+        ),
     )
 end
 
-function initialize_components(
-    mode::AbstractHyperMode,
-    rng,
-    data,
-    hp::HyperParams,
-    build_state_mlp::Function,
-    build_g_mlp::Function
-    )
- 
-    State_MLP = build_state_mlp()
-    ps_StateMLP, st_StateMLP = Lux.setup(rng, State_MLP)
+#=-------------------------------------------------------------------------------
 
-    g_MLP = build_g_mlp()
-    ps_gMLP, st_gMLP = Lux.setup(rng, g_MLP)
+Context construction
 
-    trainable_params = build_trainables(mode, ps_StateMLP, ps_gMLP, data.ODE_par_init, hp)
+Transforms raw data, builds predictor closures via
+`build_predictors`, and packs everything into the
+Stage 1 / Stage 2 context structs.
 
-    return State_MLP, st_StateMLP, g_MLP, st_gMLP, trainable_params
-end
+-------------------------------------------------------------------------------=#
+    
 
 # Checks the data tuple for raw data/IC and returns accordingly
 raw_training_targets(data) = hasproperty(data, :Y_train_raw) ? data.Y_train_raw : data.Y_train
@@ -176,46 +219,63 @@ raw_initial_state(data) = hasproperty(data, :y0_init_raw) ? data.y0_init_raw : d
 
 target_scale(Y_train) = max.(std(Y_train; dims = 2), 1f-6)
 
-function build_contexts(State_MLP, st_StateMLP, g_MLP, st_gMLP, data, hp::HyperParams;
-                        transform::AbstractStateTransform = IdentityTransform())
+"""
+    build_contexts(State_MLP, st_StateMLP, g_MLP, st_gMLP,
+                   data, hp; transform, arch_mode)
 
-    # Transform the training targets (raw data)
+Build both training contexts.  The architecture mode controls
+which predictor closures are created and whether IC loss is
+skipped.
+"""
+function build_contexts(
+    State_MLP, st_StateMLP, g_MLP, st_gMLP,
+    data, hp::HyperParams;
+    transform::AbstractStateTransform = IdentityTransform(),
+    arch_mode::AbstractArchitectureMode = LuxMLP(),
+)
+    # Transform raw training data into network coordinates
     Y_train_raw = raw_training_targets(data)
-    y0_raw = raw_initial_state(data)
+    y0_raw      = raw_initial_state(data)
 
-    Y_train = forward_state(transform, Y_train_raw)
-    y0_obs = forward_state(transform, y0_raw)
+    Y_train     = forward_state(transform, Y_train_raw)
+    y0_obs      = forward_state(transform, y0_raw)
     Y_train_std = target_scale(Y_train)
 
-    
-    
-    # Context for Stage 1 (Supervised/Data-fitting)
+    # Build predictor closures — the arch_mode dispatch selects
+    # soft vs hardwired IC, FD vs analytic derivatives, etc.
+    predictors = build_predictors(
+        arch_mode,
+        State_MLP, st_StateMLP,
+        g_MLP, st_gMLP,
+        y0_obs,
+    )
+
     ctx_stage1 = PINNCtxStage1(
-        State_MLP,
-        st_StateMLP,
+        predictors.predict_state,
+        predictors.predict_deriv,
         data.t_train,
         Y_train,
         Y_train_std,
         y0_obs,
         transform,
+        predictors.skip_ic_loss,
         hp.ϵ_ic,
         hp.ϵ_Data,
         hp.ϵ_L1_state,
         data.t_span,
     )
-    
-    # Context for Stage 2 (ODE-regularized/Unsupervised)
+
     ctx_stage2 = PINNCtxStage2(
-        State_MLP,
-        st_StateMLP,
-        g_MLP,
-        st_gMLP,
+        predictors.predict_state,
+        predictors.predict_deriv,
+        predictors.predict_g,
         data.t_train,
         Y_train,
         Y_train_std,
-        Y_train_std,  # This is purely for initialization, will change before stage 2 starts
+        Y_train_std,      # placeholder for G_stage1_std; replaced before Stage 2
         y0_obs,
         transform,
+        predictors.skip_ic_loss,
         hp.ϵ_ic,
         hp.ϵ_Data,
         hp.ϵ_ode,
@@ -225,106 +285,28 @@ function build_contexts(State_MLP, st_StateMLP, g_MLP, st_gMLP, data, hp::HyperP
         data.t_span,
         data.ODE_par_bounds,
     )
-    
+
     return ctx_stage1, ctx_stage2
 end
 
-function run_stage1(initial_params,
-                    ctx_stage1,
-                    Opt_alg_stage1,
-                    maxiters_stage1,
-                    default_supervised_loss,
-                    callback_function,
-                    mode::AbstractHyperMode)
-    
-    println("########## Starting Stage 1: Supervised Training ##########")
+"""
+    rebuild_ctx_stage2(ctx, frozen_scale)
 
-    loss_closure(ps, ctx) = default_supervised_loss(ps, ctx, mode)
-    optfun1 = make_optfun(loss_closure)
-    
-    prob1   = Optimization.OptimizationProblem(optfun1, initial_params, ctx_stage1)
-
-    res1    = Optimization.solve(
-        prob1,
-        Opt_alg_stage1;
-        maxiters = maxiters_stage1,
-        callback = callback_function
-    )
-
-    return res1.u
-end
-
-function run_stage2(
-    stage1_params, 
-    ctx_stage2, 
-    Opt_alg_stage2, 
-    maxiters_stage2, 
-    architecture::Function, 
-    ode_param_constructor, 
-    user_loss_functions::AbstractVector{<:Function}, 
-    callback_function::Function, 
-    default_unsupervised_loss,
-    mode::AbstractHyperMode)
-    
-    println("########## Starting Stage 2: ODE-Regularized Training ##########")
-
-    # Define the core unsupervised loss closure (used for ODE and L1 regularization)
-    loss_closure(ps, ctx) = default_unsupervised_loss(ps, ctx,
-                                                      mode, architecture,
-                                                      ode_param_constructor)
-
-    # Define the combined loss, including user-defined losses
-    loss_combined(ps, ctx) = begin
-        l1 = loss_closure(ps, ctx)
-        l2 = isempty(user_loss_functions) ? zero(l1) :
-            sum(f(ps, ctx) for f in user_loss_functions)
-        l1 + l2
-    end
-
-    optfun2 = make_optfun(loss_combined)
-    prob2   = Optimization.OptimizationProblem(optfun2, stage1_params, ctx_stage2)
-
-    res2    = Optimization.solve(
-        prob2,
-        Opt_alg_stage2;
-        maxiters = maxiters_stage2,
-        callback = callback_function
-    )
-    
-    return res2.u
-end
-
-function extract_learned_hyper(ps) 
-    if hasproperty(ps, :hyper)
-        h = ps.hyper
-        # Parameters were stored as log(ε) to keep them unconstrained;
-        # exp() recovers the positive ε values the loss functions see.
-        return HyperParams(
-            exp(h.log_ϵ_ic),
-            exp(h.log_ϵ_ode),
-            exp(h.log_ϵ_Data),
-            exp(h.log_ϵ_L1_state),
-            exp(h.log_ϵ_L1_g),
-        )
-    else
-        # Fixed-hyperparameter training: no learned ε to report.
-        nan = NaN32
-        return HyperParams(nan, nan, nan, nan, nan)
-    end
-end
-
+Return a new Stage 2 context identical to `ctx` except that
+`G_stage1_std` is replaced with `frozen_scale`.
+"""
 function rebuild_ctx_stage2(ctx::PINNCtxStage2, frozen_scale::AbstractMatrix)
     PINNCtxStage2(
-        ctx.State_MLP,
-        ctx.st_StateMLP,
-        ctx.g_MLP,
-        ctx.st_gMLP,
+        ctx.predict_state,
+        ctx.predict_deriv,
+        ctx.predict_g,
         ctx.t_train,
         ctx.Y_train,
         ctx.Y_train_std,
-        frozen_scale,       # <-- the only field that changes
+        frozen_scale,
         ctx.y0_obs,
         ctx.transform,
+        ctx.skip_ic_loss,
         ctx.ϵ_ic,
         ctx.ϵ_Data,
         ctx.ϵ_ode,
@@ -336,279 +318,168 @@ function rebuild_ctx_stage2(ctx::PINNCtxStage2, frozen_scale::AbstractMatrix)
     )
 end
 
-function train(
+#=-------------------------------------------------------------------------------
+
+Stage Runners
+
+-------------------------------------------------------------------------------=#
+
+"""
+    run_stage1(initial_params, ctx, opt, maxiters,
+               supervised_loss_fn, callback, mode)
+
+Run Stage 1 (supervised) optimisation and return the trained
+parameter vector.
+"""
+function run_stage1(
+    initial_params,
+    ctx_stage1,
+    Opt_alg_stage1,
+    maxiters_stage1,
+    default_supervised_loss,
+    callback_function,
     mode::AbstractHyperMode,
-    data,
-    architecture::Function,
-    ode_param_constructor,
-    hp::HyperParams= HyperParams(1f0, 1f0, 1f0, 1f0, 1f0);
-    transform::AbstractStateTransform = IdentityTransform(),
-    user_loss_functions::AbstractVector{<:Function} = Function[], 
-    seed::Integer = 1,
-    maxiters_stage1::Integer = 10_000,
-    maxiters_stage2::Integer = 1_000,
-    build_state_mlp::Function = build_state_mlp,
-    build_g_mlp::Function     = build_g_mlp,
-    callback_function::Function= callback_function_default,
-    Opt_alg_stage1 =  OptimizationOptimisers.Adam(1f-3),
-    Opt_alg_stage2 = OptimizationOptimJL.LBFGS(m = 25),
-    default_supervised_loss = supervised_loss,
-    default_unsupervised_loss = unsupervised_loss
-    )
+)
+    println("########## Starting Stage 1: Supervised Training ##########")
 
-    rng = MersenneTwister(seed)
-    
-    # 1. Initialization and Parameter Assembly
-    State_MLP, st_StateMLP, g_MLP, st_gMLP, initial_params = initialize_components(
-        mode, rng, data, hp, build_state_mlp, build_g_mlp
-    )
+    loss_closure(ps, ctx) = default_supervised_loss(ps, ctx, mode)
+    optfun = make_optfun(loss_closure)
+    prob   = Optimization.OptimizationProblem(optfun, initial_params, ctx_stage1)
 
-    # 2. Context Building
-    ctx_stage1, ctx_stage2 = build_contexts(
-        State_MLP, st_StateMLP, g_MLP, st_gMLP, data, hp; transform = transform
-    )
-    
-    # 3. Stage 1: Supervised Training
-    trainable_params_post_stage1 = run_stage1(
-        initial_params, 
-        ctx_stage1, 
-        Opt_alg_stage1, 
-        maxiters_stage1, 
-        default_supervised_loss,
-        callback_function,
-        mode
-    )
-
-    # Freeze the derivative scale from the Stage 1 network
-    frozen_scale = compute_frozen_ode_scale(trainable_params_post_stage1, ctx_stage2)
-
-    # Rebuild ctx with the correct normalization (structs are immutable)
-    ctx_stage2 = rebuild_ctx_stage2(ctx_stage2, frozen_scale)
-
-    # 4. Stage 2: ODE-regularized Training
-    ps_trained = run_stage2(
-        trainable_params_post_stage1, 
-        ctx_stage2, 
-        Opt_alg_stage2, 
-        maxiters_stage2, 
-        architecture, 
-        ode_param_constructor, 
-        user_loss_functions, 
-        callback_function, 
-        default_unsupervised_loss,
-        mode
-    )
-
-    # 5. Metrics and Return
-    println("########## Training Complete. Calculating Final Metrics ##########")
-    d_mse, o_mse, g_s = metrics_stage2(ps_trained, ctx_stage2, architecture, ode_param_constructor)
-    metrics = (data_mse = d_mse, ode_mse = o_mse, g_std = g_s)
-
-    hyper_final = extract_learned_hyper(ps_trained)
-
-    return TrainResult{typeof(ps_trained), typeof(ctx_stage2), typeof(State_MLP), typeof(g_MLP)}(
-        hyper_final, ps_trained, ctx_stage2, State_MLP, g_MLP, metrics
-    )
-end
-
-########## FIXED HYPERPARAM TRAINING ##########
-
-function train_fixed_hyper(
-    data,
-    architecture::Function,
-    ode_param_constructor,
-    hp::HyperParams= HyperParams(1f0, 1f0, 1f0, 1);
-    transform::AbstractStateTransform = IdentityTransform(),
-    user_loss_functions::AbstractVector{<:Function} = Function[], 
-    seed::Integer = 1,
-    maxiters_stage1::Integer = 10_000,
-    maxiters_stage2::Integer = 1_000,
-    build_state_mlp::Function = build_state_mlp,
-    build_g_mlp::Function     = build_g_mlp,
-    callback_function::Function= callback_function_default,
-    Opt_alg_stage1 =  OptimizationOptimisers.Adam(1f-3),
-    Opt_alg_stage2 = OptimizationOptimJL.LBFGS(m = 25),
-    # Defaults changed to the fixed versions
-    default_supervised_loss = fixed_supervised_loss,
-    default_unsupervised_loss = fixed_unsupervised_loss
-    )
-
-    rng = MersenneTwister(seed)
-    
-    # 1. Initialization (Fixed version)
-    State_MLP, st_StateMLP, g_MLP, st_gMLP, initial_params = initialize_components_fixed(
-        rng, data, hp, build_state_mlp, build_g_mlp
-    )
-
-    # 2. Context Building (Standard, as it populates ctx with hp values)
-    ctx_stage1, ctx_stage2 = build_contexts(
-        State_MLP, st_StateMLP, g_MLP, st_gMLP, data, hp; transform = transform
-    )
-    
-    # 3. Stage 1: Supervised Training
-    trainable_params_stage1 = run_stage1(
-        initial_params, 
-        ctx_stage1, 
-        Opt_alg_stage1, 
-        maxiters_stage1, 
-        default_supervised_loss,
-        callback_function
-    )
-
-    # Freeze the derivative scale from the Stage 1 network
-    frozen_scale = compute_frozen_ode_scale(trainable_params_stage1, ctx_stage2)
-
-    # Rebuild ctx with the correct normalization (structs are immutable)
-    ctx_stage2 = rebuild_ctx_stage2(ctx_stage2, frozen_scale)
-
-    # 4. Stage 2: ODE-regularized Training
-    ps_trained = run_stage2(
-        trainable_params_stage1, 
-        ctx_stage2, 
-        Opt_alg_stage2, 
-        maxiters_stage2, 
-        architecture, 
-        ode_param_constructor, 
-        user_loss_functions, 
-        callback_function, 
-        default_unsupervised_loss
-    )
-
-    # 5. Metrics and Return
-    println("########## Training Complete (Fixed HyperParams). Calculating Final Metrics ##########")
-    d_mse = loss_Data(ps_trained, ctx_stage2)
-    o_mse = loss_ODE(ps_trained, ctx_stage2, architecture, ode_param_constructor)
-    metrics = (data_mse = d_mse, ode_mse = o_mse)
-
-    hyper_final = extract_learned_hyper(ps_trained)
-
-    return TrainResult{typeof(ps_trained), typeof(ctx_stage2), typeof(State_MLP), typeof(g_MLP)}(
-        hyper_final, ps_trained, ctx_stage2, State_MLP, g_MLP, metrics
-    )
-end
-
-
-
-
-
-
-
-
-#--------Training Function--------
-"""
-Run the two-stage training for given `hp::HyperParams` and `data` NamedTuple.
-
-`data` must contain:
-    t_train       :: AbstractMatrix (1×N or similar)
-    Y_train       :: AbstractMatrix (states×N)
-    Y_train_std   :: same shape as Y_train (for normalization)
-    t_dense       :: dense time grid (1×N₁)
-    t_span        :: Vector{Float32} (e.g. [0f0, t_max])
-    y0_init       :: initial condition vector
-    ODE_par_init  :: NamedTuple of initial ODE parameters
-    ODE_par_bounds:: NamedTuple of (lo,hi) containers for each param
-"""
-function train_once_legacy(
-    data,
-    architecture::Function,
-    ode_param_constructor,
-    hp::HyperParams= HyperParams(1f0, 1f0, 1f0, 1);
-    transform = IdentityTransform(),
-    user_loss_functions::AbstractVector{<:Function} = Function[], 
-    seed::Integer = 1,
-    maxiters_stage1::Integer  = 10_000,
-    maxiters_stage2::Integer  = 1_000,
-    build_state_mlp::Function = build_state_mlp,
-    build_g_mlp::Function     = build_g_mlp,
-    callback_function::Function= callback_function_default,
-    Opt_alg_stage1 =  OptimizationOptimisers.Adam(1f-4),
-    Opt_alg_stage2 = OptimizationOptimJL.LBFGS(m = 25),
-    default_supervised_loss = loss_supervised,
-    default_unsupervised_loss = loss_unsupervised
-    )
-    rng = MersenneTwister(seed)
-
-    # Build networks
-    State_MLP = build_state_mlp()
-    ps_StateMLP, st_StateMLP = Lux.setup(rng, State_MLP)
-
-    g_MLP    = build_g_mlp()
-    ps_gMLP, st_gMLP = Lux.setup(rng, g_MLP)
-
-    # Initial ODE parameters (NamedTuple)
-    trainable_params = ComponentArrays.ComponentArray(
-        StateMLP = ps_StateMLP,
-        gMLP     = ps_gMLP,
-        ODE_par  = data.ODE_par_init,
-        hyper    = (
-            ϵ_ic  = hp.ϵ_ic,
-            ϵ_ode = hp.ϵ_ode,
-            ϵ_Data = hp.ϵ_Data,
-            ϵ_L1  = hp.ϵ_L1
-        )
-    )
-
-    ctx_stage1, ctx_stage2 = build_contexts(
-        State_MLP, st_StateMLP, g_MLP, st_gMLP, data, hp; transform = transform
-    )
-
-
-    # Small helper for OptimizationFunction
-    make_optfun(loss) = Optimization.OptimizationFunction(
-        (θ, p) -> loss(θ, p),
-        Optimization.AutoZygote()
-    )
-
-    ########## Stage 1: supervised ##########
-    optfun1 = make_optfun(default_supervised_loss)
-    prob1   = Optimization.OptimizationProblem(optfun1, trainable_params, ctx_stage1)
-
-    res1    = Optimization.solve(
-        prob1,
-        Opt_alg_stage1;
+    res = Optimization.solve(
+        prob, Opt_alg_stage1;
         maxiters = maxiters_stage1,
+        callback = callback_function,
     )
 
-    trainable_params_stage1 = res1.u
+    return res.u
+end
 
-    ########## Stage 2: ODE-regularized ##########
-    loss_closure(ps, ctx) = default_unsupervised_loss(ps, ctx, architecture, ode_param_constructor)
+"""
+    run_stage2(stage1_params, ctx, opt, maxiters, architecture,
+               ode_param_constructor, user_losses, callback,
+               unsupervised_loss_fn, mode)
 
+Run Stage 2 (ODE-regularised) optimisation and return the
+trained parameter vector.
+"""
+function run_stage2(
+    stage1_params,
+    ctx_stage2,
+    Opt_alg_stage2,
+    maxiters_stage2,
+    architecture::Function,
+    ode_param_constructor,
+    user_loss_functions::AbstractVector{<:Function},
+    callback_function::Function,
+    default_unsupervised_loss,
+    mode::AbstractHyperMode,
+)
+    println("########## Starting Stage 2: ODE-Regularized Training ##########")
+
+    # Core physics-informed loss
+    loss_closure(ps, ctx) = default_unsupervised_loss(
+        ps, ctx, mode, architecture, ode_param_constructor
+    )
+
+    # Combine with any user-supplied auxiliary losses
     loss_combined(ps, ctx) = begin
-	l1 = loss_closure(ps, ctx)
+        l1 = loss_closure(ps, ctx)
         l2 = isempty(user_loss_functions) ? zero(l1) :
             sum(f(ps, ctx) for f in user_loss_functions)
         l1 + l2
     end
 
-    optfun2 = make_optfun(loss_combined)
-    prob2   = Optimization.OptimizationProblem(optfun2, trainable_params_stage1, ctx_stage2)
+    optfun = make_optfun(loss_combined)
+    prob   = Optimization.OptimizationProblem(optfun, stage1_params, ctx_stage2)
 
-    res2    = Optimization.solve(
-        prob2,
-        Opt_alg_stage2;
+    res = Optimization.solve(
+        prob, Opt_alg_stage2;
         maxiters = maxiters_stage2,
-        callback = callback_function
+        callback = callback_function,
     )
-    # trainable_params_stage2 = res2.u
-    
-    
-    # prob3   = Optimization.OptimizationProblem(optfun2, trainable_params_stage2, ctx_stage2)    
 
-    # res3    = Optimization.solve(
-    #     prob3,
-    #     Opt_alg_stage2;
-    #     maxiters = maxiters_stage2,
-    #     callback = callback_function
-    # )
+    return res.u
+end
 
-    # ps_trained = res3.u
-    ps_trained = res2.u
-    
-    d_mse, o_mse, g_s = metrics_stage2(ps_trained, ctx_stage2, architecture, ode_param_constructor)
+#=-------------------------------------------------------------------------------
+
+Top-level entry points
+
+-------------------------------------------------------------------------------=#
+
+using Random
+using Base.Threads
+
+"""
+    train(mode, data, architecture, ode_param_constructor, hp; kwargs...)
+
+Full two-stage training with explicit hyper mode (Fixed or Adaptive).
+"""
+function train(
+    mode::AbstractHyperMode,
+    data,
+    architecture::Function,
+    ode_param_constructor,
+    hp::HyperParams = HyperParams(1f0, 1f0, 1f0, 1f0, 1f0);
+    transform::AbstractStateTransform = IdentityTransform(),
+    arch_mode::AbstractArchitectureMode = LuxMLP(),
+    user_loss_functions::AbstractVector{<:Function} = Function[],
+    seed::Integer = 1,
+    maxiters_stage1::Integer = 10_000,
+    maxiters_stage2::Integer = 1_000,
+    build_state_mlp::Function = build_state_mlp,
+    build_g_mlp::Function     = build_g_mlp,
+    callback_function::Function = callback_function_default,
+    Opt_alg_stage1 = OptimizationOptimisers.Adam(1f-3),
+    Opt_alg_stage2 = OptimizationOptimJL.LBFGS(m = 25),
+    default_supervised_loss   = supervised_loss,
+    default_unsupervised_loss = unsupervised_loss,
+)
+    rng = MersenneTwister(seed)
+
+    # 1. Build networks and raw parameters (arch_mode dispatches in Predictors.jl)
+    State_MLP, st_StateMLP, g_MLP, st_gMLP, raw_ps =
+        initialize_components(arch_mode, rng, data, build_state_mlp, build_g_mlp)
+
+    # 2. Append hyper entries if adaptive, then wrap in ComponentArray
+    initial_params = build_trainables(mode, raw_ps, hp)
+
+    # 3. Build training contexts (applies transform, creates predictor closures)
+    ctx_stage1, ctx_stage2 = build_contexts(
+        State_MLP, st_StateMLP, g_MLP, st_gMLP, data, hp;
+        transform = transform, arch_mode = arch_mode,
+    )
+
+    # 3. Stage 1: supervised data fitting
+    ps_post_stage1 = run_stage1(
+        initial_params, ctx_stage1, Opt_alg_stage1, maxiters_stage1,
+        default_supervised_loss, callback_function, mode,
+    )
+
+    # 4. Freeze derivative scale from Stage 1 network
+    frozen_scale = compute_frozen_ode_scale(ps_post_stage1, ctx_stage2)
+    ctx_stage2 = rebuild_ctx_stage2(ctx_stage2, frozen_scale)
+
+    # 5. Stage 2: ODE-regularised training
+    ps_trained = run_stage2(
+        ps_post_stage1, ctx_stage2, Opt_alg_stage2, maxiters_stage2,
+        architecture, ode_param_constructor,
+        user_loss_functions, callback_function,
+        default_unsupervised_loss, mode,
+    )
+
+    # 6. Final metrics
+    println("########## Training Complete. Calculating Final Metrics ##########")
+    d_mse, o_mse, g_s = metrics_stage2(
+        ps_trained, ctx_stage2, architecture, ode_param_constructor
+    )
     metrics = (data_mse = d_mse, ode_mse = o_mse, g_std = g_s)
 
-    return TrainResult{typeof(ps_trained), typeof(ctx_stage2), typeof(State_MLP), typeof(g_MLP)}(
-        hp, ps_trained, ctx_stage2, State_MLP, g_MLP, metrics
+    hyper_final = extract_learned_hyper(ps_trained)
+
+    return TrainResult{typeof(ps_trained), typeof(ctx_stage2),
+                       typeof(State_MLP), typeof(g_MLP)}(
+        hyper_final, ps_trained, ctx_stage2, State_MLP, g_MLP, metrics
     )
 end
