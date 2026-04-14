@@ -1,84 +1,173 @@
-using ComponentArrays
-using Lux, NNlib
-using Optimization, OptimizationOptimisers
-#using Zygote
-using Enzyme
-using ForwardDiff
+#=-------------------------------------------------------------------------------
+Losses.jl
+
+Loss computations for the PINN training pipeline.
+
+Every loss function accesses model predictions exclusively through the
+three predictor closures stored on the context struct:
+
+    ctx.predict_state(ps, t_grid)  →  (n_states × B)
+    ctx.predict_deriv(ps, t_grid)  →  (n_states × B)
+    ctx.predict_g(ps, t_grid)      →  (n_g × B)
+
+The file is organised top-down:
+  1. Scalar utilities (MSE, distance penalties)
+  2. Individual loss terms
+  3. Hyperparameter resolution (fixed vs adaptive)
+  4. Composite loss assembly (supervised / unsupervised)
+-------------------------------------------------------------------------------=#
+
+#=-------------------------------------------------------------------------------
+
+Scalar Utilities
+
+-------------------------------------------------------------------------------=#
+
 using Statistics
-using Random
 
-dist_outside(x, lower, upper) = sum(@. max(0f0, lower - x) + max(0f0, x - upper))
+"""
+    MSE(ŷ, y, denom)
 
-# MSE(ŷ, y) = Statistics.mean(abs2, vec(ŷ .- y))
-
-function MSE(ŷ, y, denom)  # normalized MSE
-    t = vec((ŷ .- y) ./ denom)
+Normalised mean squared error.  `denom` is a per-state scale factor
+(typically std of training targets) that prevents states with large
+magnitudes from dominating the loss.
+"""
+function MSE(ŷ, y, denom)
+    t = vec((ŷ - y) ./ denom)
     Statistics.mean(abs2, t)
 end
 
-function dNNdt_fd(smodel, tvec::AbstractVector; h::Real = 1f-3)
-    # Build two time batches: t + h and t - h, each as 1×B
-    Tplus  = reshape(tvec .+ h, 1, :)
-    Tminus = reshape(tvec .- h, 1, :)
+"""
+    dist_outside(x, lower, upper)
 
-    Yplus  = smodel(Tplus)    # n_states×B
-    Yminus = smodel(Tminus)   # n_states×B
+Sum of constraint violations: how far `x` lies outside `[lower, upper]`.
+Returns zero when all elements are within bounds. This is used as a means to
+calculate how far ODE params in the known physics are violating their
+corresponding bounds.
+"""
+dist_outside(x, lower, upper) = sum(@. max(0f0, lower - x) + max(0f0, x - upper))
 
-    dYdt = (Yplus .- Yminus) ./ (2h)  # n_states×B
-    return dYdt
-end
 
 """
-    compute_frozen_ode_scale(ps_stage1, ctx_stage1_or_2; min_scale=1f-6)
+    l1_mean(x)
 
-Differentiate the Stage 1 state network on the dense collocation grid and
-return a frozen (n_states × 1) normalization scale.
-
-Call this *once* between Stage 1 and Stage 2. The returned matrix is detached
-from the computation graph — it's a plain array constant.
-
-Arguments
-- `ps_stage1`:  parameter vector at the end of Stage 1
-- `ctx_stage1_or_2`: any context that has `.State_MLP`, `.st_StateMLP`,
-                      and `.t_dense` (Stage 2 context works fine)
-- `min_scale`:  floor to prevent degenerate normalization on flat states
+Mean absolute value — an L1 regularization term that encourages sparsity.
 """
-function compute_frozen_ode_scale(
-    ps_stage1,
-    ctx;
-    min_scale::Float32 = 1f-6,
-)
-    smodel = state_model(ps_stage1, ctx)
-    t_dense_vec = vec(ctx.t_dense)
+l1_mean(x) = sum(abs, x) / length(x)
 
-    # Reuse the existing FD helper — the Stage 1 network is smooth so
-    # the O(h²) error from central differences is negligible here
-    dYdt = dNNdt_fd(smodel, t_dense_vec)
+"""
+    metrics_stage2(ps, ctx, architecture, ode_param_constructor)
+        -> (data_mse, ode_mse, g_std)
 
-    scale = std(dYdt; dims = 2)
-    scale = max.(scale, min_scale)
+Compute final scalar diagnostics using the trained parameters.
+"""
+function metrics_stage2(ps, ctx, architecture::Function, ode_param_constructor)
+    data_mse = loss_Data(ps, ctx)
+    ode_mse  = loss_ODE(ps, ctx, architecture, ode_param_constructor)
 
-    # Detach from any AD tape so this is treated as a constant in Stage 2
-    return Float32.(Array(scale))
+    # Standard deviation of g-network output as a health check:
+    # near-zero std suggests the g-network collapsed to a constant
+    g_out = ctx.predict_g(ps, ctx.t_dense)
+    g_std = std(vec(g_out))
+
+    return (data_mse = data_mse, ode_mse = ode_mse, g_std = g_std)
+end
+
+#=-------------------------------------------------------------------------------
+
+Individual Loss Functions
+
+Each function takes (ps, ctx) and returns a scalar. The predictors are expected
+to be in ctx
+
+-------------------------------------------------------------------------------=#
+
+"""
+    loss_Data(ps, ctx) -> Float32
+
+MSE between state predictions at training time points and the
+(transformed) training targets.
+"""
+function loss_Data(ps, ctx)
+    ŷ = ctx.predict_state(ps, ctx.t_train)
+    return MSE(ŷ, ctx.Y_train, ctx.Y_train_std)
 end
 
 
-# L1 penalty is now network specific to have finer control of the optimization
-function l1_mean(x)
-    return sum(abs, x) / length(x)
+"""
+    loss_IC(ps, ctx) -> Float32
+
+MSE between the predicted initial state and the (transformed)
+observed IC.  Should be skipped when the IC is structurally
+enforced (hard-wired into the state predictor).
+"""
+function loss_IC(ps, ctx)
+    # fill(...) returns a 1x1 matrix without tripping Zygote up.
+    ŷ0 =  ctx.predict_state(ps, fill(0f0, 1, 1))
+    denom = max.(abs.(ctx.y0_obs), 1f-06)
+    return MSE(ŷ0, ctx.y0_obs, denom)
 end
 
+
+"""
+   loss_ODE(ps, ctx, architecture, ode_param_constructor)
+
+Physics-residual loss: MSE between the state network's time derivative
+(from `predict_deriv`) and the architecture RHS evaluated with
+the current state and g predictions.
+
+`architecture(y_raw, g, ode_params)` is the user's grey-box RHS in raw
+coordinates; `transformed_rhs` handles the chain-rule bridge to the
+network's coordinate space
+"""
+function loss_ODE(ps, ctx, architecture::Function, ode_param_constructor)
+    t_dense = ctx.t_dense
+    ode_par = ode_param_constructor(ps.ODE_par)
+
+    # All three predictions via contract closures
+    ẑ     = ctx.predict_state(ps, t_dense)
+    dẑdt  = ctx.predict_deriv(ps, t_dense)
+    g_arr = ctx.predict_g(ps, t_dense)
+
+    # RHS in the transformed coordinate space
+    f_ẑ = transformed_rhs(ctx.transform, ẑ, g_arr, ode_par, architecture)
+
+    return MSE(dẑdt, f_ẑ, ctx.G_stage1_std)
+end
+
+
+#-----L1 Regularization----------------------------------------------------------
+
+"""
+    l1_penalty_state(ps) -> Float32
+
+Mean absolute weight magnitude of the state network.
+"""
 function l1_penalty_state(ps)
     ws = ComponentArrays.getdata(ps.StateMLP)
     return l1_mean(ws)
 end
 
+
+"""
+    l1_penalty_g(ps) -> Float32
+
+Mean absolute weight magnitude of the g-network.
+"""
 function l1_penalty_g(ps)
     wg = ComponentArrays.getdata(ps.gMLP)
     return l1_mean(wg)
 end
 
-function param_bound_penalty(ps, ctx::PINNCtxStage2)
+#-----Parameter Bound Penalty----------------------------------------------------
+
+"""
+    param_bound_penalty(ps, ctx) -> Float32
+
+Soft constraint that penalises ODE parameters straying outside
+their declared bounds.  Uses a one-sided quadratic barrier.
+"""
+function param_bound_penalty(ps, ctx)
     p = ps.ODE_par
     b = ctx.ODE_par_bounds
     keys = propertynames(b)
@@ -90,134 +179,132 @@ function param_bound_penalty(ps, ctx::PINNCtxStage2)
     end
 end
 
-function bound_loss(ps, ctx::PINNCtxStage2; scale=1000f0)
-    scale * param_bound_penalty(ps, ctx)
+"""
+    bound_loss(ps, ctx; scale=1000f0) -> Float32
+
+Scaled wrapper around `param_bound_penalty` for direct use in
+composite losses.
+"""
+bound_loss(ps, ctx; scale = 1000f0) = scale * param_bound_penalty(ps, ctx)
+
+
+#=-------------------------------------------------------------------------------
+
+Hyperparameter Resolution
+
+Maps (ps, ctx, mode) → a NamedTuple of ε values.
+Fixed mode reads ε from the context; adaptive mode reads
+log(ε) from the trainable parameters and exponentiates.
+
+-------------------------------------------------------------------------------=#
+
+#-----Dispatch Tags--------------------------------------------------------------
+
+abstract type AbstractHyperMode end
+struct FixedHyper <: AbstractHyperMode end
+struct AdaptiveHyper <: AbstractHyperMode end
+
+#-----Fixed Hyperparameter ϵ resolver--------------------------------------------
+
+function resolve_epsilons(ps, ctx::PINNCtxStage1, ::FixedHyper)
+    (ϵ_ic       = ctx.ϵ_ic,
+     ϵ_Data     = ctx.ϵ_Data,
+     ϵ_L1_state = ctx.ϵ_L1_state)
+end
+
+function resolve_epsilons(ps, ctx::PINNCtxStage2, ::FixedHyper)
+    (ϵ_ic       = ctx.ϵ_ic,
+     ϵ_Data     = ctx.ϵ_Data,
+     ϵ_ode      = ctx.ϵ_ode,
+     ϵ_L1_state = ctx.ϵ_L1_state,
+     ϵ_L1_g     = ctx.ϵ_L1_g)
+end
+
+#-----Adaptive Hyperparameter ϵ resolver-----------------------------------------
+
+function resolve_epsilons(ps, ctx::PINNCtxStage1, ::AdaptiveHyper)
+    h = ps.hyper
+    (ϵ_ic       = exp(h.log_ϵ_ic),
+     ϵ_Data     = exp(h.log_ϵ_Data),
+     ϵ_L1_state = exp(h.log_ϵ_L1_state))
+end
+
+function resolve_epsilons(ps, ctx::PINNCtxStage2, ::AdaptiveHyper)
+    h = ps.hyper
+    (ϵ_ic       = exp(h.log_ϵ_ic),
+     ϵ_Data     = exp(h.log_ϵ_Data),
+     ϵ_ode      = exp(h.log_ϵ_ode),
+     ϵ_L1_state = exp(h.log_ϵ_L1_state),
+     ϵ_L1_g     = exp(h.log_ϵ_L1_g))
+end
+
+#-----Hyper Penalty--------------------------------------------------------------
+
+hyper_penalty(ps, ::FixedHyper) = 0f0
+
+function hyper_penalty(ps, ::AdaptiveHyper)
+    h = ps.hyper
+    2f0 * (h.log_ϵ_ic + h.log_ϵ_ode + h.log_ϵ_Data +
+           h.log_ϵ_L1_state + h.log_ϵ_L1_g)
 end
 
 
-function loss_Data(ps, ctx)
-    smodel = state_model(ps, ctx)
-    Ttrain = ctx.t_train
-    Ytrain = ctx.Y_train
-    YtrainSTD = ctx.Y_train_std
-    Data_MSE = MSE(smodel(Ttrain), Ytrain, YtrainSTD)
-    return Data_MSE
-end
+#=-------------------------------------------------------------------------------
 
-function loss_IC(ps, ctx)
-    smodel = state_model(ps, ctx)
-    # tspan = ctx.t_span
-    init_obs = ctx.y0_obs
-    denom = max.(abs.(init_obs), 1f-6)
-    # This needs to change. Currently is an arbitrary value
-    IC_MSE = MSE(smodel([0f0]'), init_obs, denom)
-    return IC_MSE
-end
+Composite loss assembly
 
-function loss_ODE(
-    ps,
-    ctx::PINNCtxStage2,
-    architecture::Function,
-    ODE_param_constructor,
-    )
-    smodel   = state_model(ps, ctx)
-    gmodel  = g_model(ps, ctx)
-    ODE_par = ODE_param_constructor(ps.ODE_par)
-    Tdense  = ctx.t_dense
-    ẑ = smodel(Tdense)
-    g_arr = gmodel(Tdense)
-    dNNdt   = dNNdt_fd(smodel, vec(Tdense))         # 3×B
-    f_ŷ     = transformed_rhs(ctx.transform, ẑ, g_arr, ODE_par, architecture)
+These combine the individual terms with ε weighting.
+The `skip_ic_loss` flag on the context controls whether
+the IC term is included (soft IC) or dropped (hardwired IC).
 
-    return  MSE(dNNdt, f_ŷ, ctx.G_stage1_std)
+-------------------------------------------------------------------------------=#
+
+"""
+    supervised_loss(ps, ctx, mode) -> Float32
+
+Stage 1 composite: data fit + IC penalty + L1 state regularisation.
+IC term is omitted when `ctx.skip_ic_loss == true`.
+"""
+function supervised_loss(ps, ctx, mode::AbstractHyperMode)
+    hp = resolve_epsilons(ps, ctx, mode)
+    penalty = hyper_penalty(ps, mode)
+
+    L = loss_Data(ps, ctx) / (hp.ϵ_Data^2 + 1f-6) +
+        l1_penalty_state(ps) / (hp.ϵ_L1_state^2 + 1f-6) +
+        penalty
+
+    # IC term: skip when the architecture structurally enforces it
+    if !ctx.skip_ic_loss
+        L += loss_IC(ps, ctx) / (hp.ϵ_ic^2 + 1f-6)
+    end
+
+    return 0.5f0 * L
 end
 
 
-function self_adaptive_supervised_loss(ps, ctx::PINNCtxStage1)
+"""
+    unsupervised_loss(ps, ctx, mode, architecture, ode_param_constructor) -> Float32
 
-    hyperparams = ps.hyper
-   
-    ϵ_ic_sq        = exp(2f0 * hyperparams.log_ϵ_ic)       + 1f-6
-    ϵ_Data_sq      = exp(2f0 * hyperparams.log_ϵ_Data)     + 1f-6
-    ϵ_L1_state_sq  = exp(2f0 * hyperparams.log_ϵ_L1_state) + 1f-6
+Stage 2 composite: data fit + IC penalty + ODE residual + L1 on both
+networks + parameter bound penalty.
+IC term is omitted when `ctx.skip_ic_loss == true`.
+"""
+function unsupervised_loss(ps, ctx, mode::AbstractHyperMode,
+                           architecture, ode_param_constructor)
+    hp = resolve_epsilons(ps, ctx, mode)
+    penalty = hyper_penalty(ps, mode)
 
-    hyper_loss = 2f0 * hyperparams.log_ϵ_ic +
-        2f0 * hyperparams.log_ϵ_Data +
-        2f0 * hyperparams.log_ϵ_L1_state
+    L = loss_Data(ps, ctx)    / (hp.ϵ_Data^2 + 1f-6) +
+        l1_penalty_state(ps)  / (hp.ϵ_L1_state^2 + 1f-6) +
+        loss_ODE(ps, ctx,
+                 architecture,
+                 ode_param_constructor) / (hp.ϵ_ode^2 + 1f-6) +
+        l1_penalty_g(ps)      / (hp.ϵ_L1_g^2 + 1f-6) +
+        penalty
 
-    return 0.5 * (
-        loss_IC(ps, ctx) / ϵ_ic_sq +
-        loss_Data(ps, ctx) / ϵ_Data_sq +
-        l1_penalty_state(ps) / ϵ_L1_state_sq + 
-        hyper_loss
-    )
-end
+    if !ctx.skip_ic_loss
+        L += loss_IC(ps, ctx) / (hp.ϵ_ic^2 + 1f-6)
+    end
 
-function self_adaptive_unsupervised_loss(ps, ctx::PINNCtxStage2,
-                                         architecture::Function,
-                                         ODE_param_constructor
-                                         )
-
-    hyperparams = ps.hyper
-    
-    ϵ_ic_sq       = exp(2f0 * hyperparams.log_ϵ_ic)       + 1f-6
-    ϵ_Data_sq     = exp(2f0 * hyperparams.log_ϵ_Data)     + 1f-6
-    ϵ_ode_sq      = exp(2f0 * hyperparams.log_ϵ_ode)      + 1f-6
-    ϵ_L1_state_sq = exp(2f0 * hyperparams.log_ϵ_L1_state) + 1f-6
-    ϵ_L1_g_sq     = exp(2f0 * hyperparams.log_ϵ_L1_g)     + 1f-6
-
-    hyper_loss = 2f0 * hyperparams.log_ϵ_ic +
-        2f0 * hyperparams.log_ϵ_Data +
-        2f0 * hyperparams.log_ϵ_ode +
-        2f0 * hyperparams.log_ϵ_L1_state +
-        2f0 * hyperparams.log_ϵ_L1_g
-    
-    return 0.5 * (
-        loss_IC(ps, ctx) / ϵ_ic_sq +
-        loss_Data(ps, ctx) / ϵ_Data_sq +
-        loss_ODE(ps, ctx, architecture, ODE_param_constructor) / ϵ_ode_sq +
-        l1_penalty_state(ps) / ϵ_L1_state_sq +
-        l1_penalty_g(ps) / ϵ_L1_g_sq +
-        hyper_loss +
-        param_bound_penalty(ps, ctx)
-    )
-end
-
-function fixed_supervised_loss(ps, ctx::PINNCtxStage1)
-    ϵ_ic_sq       = ctx.ϵ_ic^2 + 1f-6
-    ϵ_Data_sq     = ctx.ϵ_Data^2 + 1f-6
-    ϵ_L1_state_sq = ctx.ϵ_L1_state^2 + 1f-6
-
-    return 0.5f0 * (
-        loss_IC(ps, ctx) / ϵ_ic_sq +
-        loss_Data(ps, ctx) / ϵ_Data_sq +
-        l1_penalty_state(ps) / ϵ_L1_state_sq
-    )
-end
-
-function fixed_unsupervised_loss(ps, ctx::PINNCtxStage2,
-                                 architecture::Function,
-                                 ODE_param_constructor)
-
-    ϵ_ic_sq       = ctx.ϵ_ic^2 + 1f-6
-    ϵ_Data_sq     = ctx.ϵ_Data^2 + 1f-6
-    ϵ_ode_sq      = ctx.ϵ_ode^2 + 1f-6
-    ϵ_L1_state_sq = ctx.ϵ_L1_state^2 + 1f-6
-    ϵ_L1_g_sq     = ctx.ϵ_L1_g^2 + 1f-6
-
-    L_ic      = loss_IC(ps, ctx)
-    L_data    = loss_Data(ps, ctx)
-    L_ode     = loss_ODE(ps, ctx, architecture, ODE_param_constructor)
-    L_L1s     = l1_penalty_state(ps)
-    L_L1g     = l1_penalty_g(ps)
-    L_bnd     = param_bound_penalty(ps, ctx)
-
-    return 0.5f0 * (
-        L_ic   / ϵ_ic_sq +
-        L_data / ϵ_Data_sq +
-        L_ode  / ϵ_ode_sq +
-        L_L1s  / ϵ_L1_state_sq +
-        L_L1g  / ϵ_L1_g_sq +
-        L_bnd
-    )
+    return 0.5f0 * L
 end
