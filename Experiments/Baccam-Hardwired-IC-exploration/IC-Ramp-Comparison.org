@@ -1,0 +1,905 @@
+#+TITLE: Hardwired IC Ramp Comparison — SIR vs Baccam
+#+AUTHOR: Ramakrishna Suresh
+#+PROPERTY: header-args:julia-vterm :session *julia* :results output :exports both :dir (projectile-project-root) :tangle yes :comments both
+#+STARTUP: inlineimages overview
+
+* Background
+
+The hardwired IC reparameterization ŷ(t) = z₀ + t · NN(t, θ) structurally
+enforces the initial condition but interacts poorly with log transforms.
+Near t = 0 the network must output ~(z(t) - z₀)/t, which diverges when the
+true trajectory departs from z₀ linearly — a problem amplified when states
+span many orders of magnitude (Baccam) but potentially benign when they
+don't (SIR).
+
+This notebook tests two hypotheses:
+
+1. *The transform is the problem, not the reparameterization itself.*
+   If hardwired IC works well on SIR (ZScoreTransform, states ~O(1)) but
+   poorly on Baccam (LogTransform, states ~O(10⁻² to 10⁸)), the
+   interaction with the log transform is the culprit.
+
+2. *Replacing the linear ramp t with a saturating ramp σ(t) fixes the
+   Baccam case.*  We compare three ramps:
+   - =LuxMLPHardwiredIC=: σ(t) = t  (existing)
+   - =LuxMLPTanhIC=: σ(t) = tanh(a·t)
+   - =LuxMLPPowerIC=: σ(t) = (t/t_c)^α clamped to 1
+
+The comparison matrix is:
+
+| Model  | Transform | Soft IC | Hardwired (linear) | Tanh ramp | Power ramp |
+|--------+-----------+---------+--------------------+-----------+------------|
+| SIR    | ZScore    | ✓       | ✓                  | ✓         | ✓          |
+| Baccam | Log₁₀     | ✓       | ✓                  | ✓         | ✓          |
+
+* Setup
+
+** Boilerplate
+
+#+begin_src julia-vterm :results nil
+using Pkg;
+Pkg.activate(".")
+#+end_src
+
+#+RESULTS:
+
+#+begin_src julia-vterm :results nil
+using ComponentArrays
+using Lux, NNlib
+using Optimization, OptimizationOptimisers
+using Statistics
+using Random
+using OrdinaryDiffEq
+using CairoMakie, Makie
+using Printf
+using LinearAlgebra
+BLAS.set_num_threads(1)
+
+include(joinpath(pwd(), "Src", "Fitting.jl"))
+#+end_src
+
+#+RESULTS:
+
+** New architecture modes
+
+These extend Predictors.jl with two new ramp variants.  Both structurally
+enforce z(0) = z₀ and skip the IC loss, differing only in the gating
+function σ(t).
+
+#+begin_src julia-vterm :results nil
+
+# ── Tanh ramp: σ(t) = tanh(a · t) ──────────────────────
+# a controls the steepness. Default: reaches ~0.96 by t_span midpoint.
+
+Base.@kwdef struct LuxMLPTanhIC <: AbstractArchitectureMode
+    fd_step::Float32 = 1f-03
+    a::Float32 = 1f0   # steepness; set per-problem below
+end
+
+function make_state_predictor_tanh_ic(mlp, st, y0_transformed::AbstractVector, a::Float32)
+    function predict(ps, t_grid::AbstractMatrix)
+        raw_nn = first(mlp(t_grid, ps.StateMLP, st))
+        return y0_transformed .+ tanh.(a .* t_grid) .* raw_nn
+    end
+    return predict
+end
+
+function build_predictors(mode::LuxMLPTanhIC,
+                          mlp, st, g_mlp, st_g,
+                          y0_transformed)
+    pred_state = make_state_predictor_tanh_ic(mlp, st, y0_transformed, mode.a)
+    pred_deriv = make_deriv_predictor_fd(pred_state; h = mode.fd_step)
+    pred_g     = make_g_predictor(g_mlp, st_g)
+    return (predict_state = pred_state,
+            predict_deriv = pred_deriv,
+            predict_g     = pred_g,
+            skip_ic_loss  = true)
+end
+
+# Reuse the same initialization as LuxMLP / LuxMLPHardwiredIC
+function initialize_components(::LuxMLPTanhIC, rng, data, build_state_mlp_fn, build_g_mlp_fn)
+    State_MLP = build_state_mlp_fn()
+    ps_StateMLP, st_StateMLP = Lux.setup(rng, State_MLP)
+    g_MLP = build_g_mlp_fn()
+    ps_gMLP, st_gMLP = Lux.setup(rng, g_MLP)
+    raw_ps = (StateMLP = ps_StateMLP, gMLP = ps_gMLP, ODE_par = data.ODE_par_init)
+    return State_MLP, st_StateMLP, g_MLP, st_gMLP, raw_ps
+end
+
+
+# ── Power-law ramp: σ(t) = min((t / t_c)^α, 1) ────────
+# α < 1 rises faster than linear near 0 → eliminates the 1/t singularity.
+# t_c sets the timescale at which σ saturates to 1.
+
+Base.@kwdef struct LuxMLPPowerIC <: AbstractArchitectureMode
+    fd_step::Float32 = 1f-03
+    α::Float32 = 0.5f0    # power-law exponent
+    t_c::Float32 = 1f0     # saturation timescale; set per-problem below
+end
+
+function make_state_predictor_power_ic(mlp, st, y0_transformed::AbstractVector,
+                                       α::Float32, t_c::Float32)
+    function predict(ps, t_grid::AbstractMatrix)
+        raw_nn = first(mlp(t_grid, ps.StateMLP, st))
+        ramp = min.((max.(t_grid, 0f0) ./ t_c) .^ α, 1f0)
+        # ramp = min.((t_grid ./ t_c) .^ α, 1f0)
+        return y0_transformed .+ ramp .* raw_nn
+    end
+    return predict
+end
+
+function build_predictors(mode::LuxMLPPowerIC,
+                          mlp, st, g_mlp, st_g,
+                          y0_transformed)
+    pred_state = make_state_predictor_power_ic(mlp, st, y0_transformed, mode.α, mode.t_c)
+    pred_deriv = make_deriv_predictor_fd(pred_state; h = mode.fd_step)
+    pred_g     = make_g_predictor(g_mlp, st_g)
+    return (predict_state = pred_state,
+            predict_deriv = pred_deriv,
+            predict_g     = pred_g,
+            skip_ic_loss  = true)
+end
+
+function initialize_components(::LuxMLPPowerIC, rng, data, build_state_mlp_fn, build_g_mlp_fn)
+    State_MLP = build_state_mlp_fn()
+    ps_StateMLP, st_StateMLP = Lux.setup(rng, State_MLP)
+    g_MLP = build_g_mlp_fn()
+    ps_gMLP, st_gMLP = Lux.setup(rng, g_MLP)
+    raw_ps = (StateMLP = ps_StateMLP, gMLP = ps_gMLP, ODE_par = data.ODE_par_init)
+    return State_MLP, st_StateMLP, g_MLP, st_gMLP, raw_ps
+end
+#+end_src
+
+#+RESULTS:
+
+* SIR model
+
+** True ODE and noisy data
+
+The SIR model has states ~O(1) and uses a ZScoreTransform.  This is the
+"easy" case where the hardwired IC should work well regardless of ramp
+choice, since there is no log transform to create scale mismatches.
+
+True parameters: β = 1.5, γ = 1.0, y₀ = [3, 0.001, 0].
+
+#+begin_src julia-vterm
+
+function SIR_model!(du, u, p, t)
+    S, I, R = u
+    du[1] = -p.β * S * I
+    du[2] =  p.β * S * I - p.γ * I
+    du[3] =  p.γ * I
+end
+
+sir_true_params = (β = 1.5f0, γ = 1.0f0)
+sir_u0     = Float32[3.0f0, 0.001f0, 0.0f0]
+sir_t_span = (0.0f0, 10.0f0)
+sir_t_fine = collect(range(sir_t_span[1], sir_t_span[2], length = 2001))
+
+sir_sol = solve(
+    ODEProblem(SIR_model!, sir_u0, sir_t_span, sir_true_params),
+    Tsit5(); saveat = sir_t_fine
+)
+sir_sol_array = Array(sir_sol)
+
+println("SIR ODE solved: $(size(sir_sol_array))")
+#+end_src
+
+#+RESULTS:
+: SIR ODE solved: (3, 2001)
+
+#+begin_src julia-vterm
+
+rng_sir = MersenneTwister(42)
+sir_noise_σ = 0.1f0
+sir_n_tp    = 15
+sir_n_mice  = 8
+
+sir_idx   = round.(Int, range(1, length(sir_t_fine), length = sir_n_tp))
+sir_t_obs = Float32.(sir_t_fine[sir_idx])
+sir_Y_true = Float32.(sir_sol_array[:, sir_idx])
+
+sir_ε = randn(rng_sir, Float32, 3, sir_n_tp, sir_n_mice)
+sir_Y_noisy = clamp.(
+    sir_Y_true .+ sir_noise_σ .* sir_ε,    # additive noise (states ~O(1))
+    0f0, Inf32
+)
+sir_Y_mean = dropdims(mean(sir_Y_noisy; dims = 3); dims = 3)
+
+println("SIR training data: $(sir_n_tp) timepoints × $(sir_n_mice) mice")
+println("Y_mean shape: $(size(sir_Y_mean))")
+println("Y range: $(extrema(sir_Y_mean))")
+#+end_src
+
+#+RESULTS:
+: SIR training data: 15 timepoints × 8 mice
+: Y_mean shape: (3, 15)
+: Y range: (0.012565591f0, 3.0103898f0)
+
+** Architecture definitions
+
+#+begin_src julia-vterm :results nil
+
+struct SIRParams{T<:AbstractFloat}
+    β::T
+    γ::T
+end
+SIRParams(nt::ComponentVector) = SIRParams(nt.β, nt.γ)
+
+function SIRArchitectureRaw(y::AbstractMatrix{<:Real},
+                            g::AbstractMatrix{<:Real},
+                            p::SIRParams)
+    S, I = y[1, :], y[2, :]
+    g_S, g_R = g[1, :], g[2, :]
+
+    dS = g_S
+    dI = p.β .* S .* I .- p.γ .* I
+    dR = g_R
+
+    return permutedims(hcat(dS, dI, dR))
+end
+
+# Unbounded output — needed for hardwired IC modes where the
+# network learns departures from z₀ that can be large and signed
+sir_build_state_mlp() = Lux.Chain(
+    Lux.Dense(1, 8, tanh_fast),
+    Lux.Dense(8, 6, tanh_fast),
+    Lux.Dense(6, 3),
+)
+
+sir_build_g_mlp() = Lux.Chain(
+    Lux.Dense(1, 6, tanh_fast),
+    Lux.Dense(6, 4, tanh_fast),
+    Lux.Dense(4, 2),
+)
+#+end_src
+
+#+RESULTS:
+
+** Transform and data packing
+
+#+begin_src julia-vterm :results nil
+
+sir_Y_max = maximum(sir_Y_mean; dims = 2)
+sir_transform = ZScoreTransform(zeros(Float32, 3), vec(sir_Y_max))
+
+sir_t_train = permutedims(sir_t_obs)
+sir_t_dense = permutedims(Float32.(range(
+    minimum(sir_t_obs), maximum(sir_t_obs); length = 1000)))
+sir_t_span_vec = Float32[minimum(sir_t_obs), maximum(sir_t_obs)]
+
+sir_data = (
+    t_train        = sir_t_train,
+    Y_train        = sir_Y_mean,
+    Y_train_std    = ones(Float32, 3, 1),
+    t_dense        = sir_t_dense,
+    t_span         = sir_t_span_vec,
+    y0_init        = sir_u0,
+    ODE_par_init   = (β = 1.0f0, γ = 1.0f0),
+    ODE_par_bounds = (β = Float32[0, 10], γ = Float32[0, 10]),
+)
+#+end_src
+
+#+RESULTS:
+
+** Hyperparameters
+
+#+begin_src julia-vterm :results nil
+
+#                           ϵ_ic    ϵ_ode   ϵ_Data  ϵ_L1_s  ϵ_L1_g
+sir_hp = HyperParams(       0.1f0,  0.1f0,  0.01f0, 0.5f0,  0.5f0)
+
+sir_maxiters_s1 = 50_000
+sir_maxiters_s2 = 120_000
+sir_lr = 1f-4
+#+end_src
+
+#+RESULTS:
+
+** Mode configurations
+
+#+begin_src julia-vterm :results nil
+
+sir_t_max = sir_t_span_vec[2]
+
+sir_mode_configs = Dict(
+    "soft_ic" => (
+        arch_mode = LuxMLP(),
+        hp        = sir_hp,
+    ),
+    "hardwired_linear" => (
+        arch_mode = LuxMLPHardwiredIC(),
+        hp        = HyperParams(0f0, 0.1f0, 0.01f0, 0.5f0, 0.5f0),  # ϵ_ic unused
+    ),
+    "hardwired_tanh" => (
+        arch_mode = LuxMLPTanhIC(a = 2f0 / sir_t_max),
+        hp        = HyperParams(0f0, 0.1f0, 0.01f0, 0.5f0, 0.5f0),
+    ),
+    "hardwired_power" => (
+        arch_mode = LuxMLPPowerIC(α = 0.5f0, t_c = sir_t_max / 2f0),
+        hp        = HyperParams(0f0, 0.1f0, 0.01f0, 0.5f0, 0.5f0),
+    ),
+)
+#+end_src
+
+#+RESULTS:
+
+** Training (parallel)
+
+#+begin_src julia-vterm
+
+using Base.Threads
+
+sir_tasks = Dict{String, Task}()
+for (label, cfg) in sir_mode_configs
+    sir_tasks[label] = Threads.@spawn begin
+        println("[Thread $(Threads.threadid())] SIR — Starting $label")
+
+        stats = @timed res = train(
+            FixedHyper(),
+            sir_data,
+            SIRArchitectureRaw,
+            SIRParams,
+            cfg.hp;
+            transform       = sir_transform,
+            arch_mode       = cfg.arch_mode,
+            seed            = 1,
+            maxiters_stage1 = sir_maxiters_s1,
+            maxiters_stage2 = sir_maxiters_s2,
+            Opt_alg_stage1  = OptimizationOptimisers.Adam(sir_lr),
+            Opt_alg_stage2  = OptimizationOptimisers.Adam(sir_lr),
+            build_state_mlp = sir_build_state_mlp,
+            build_g_mlp     = sir_build_g_mlp,
+        )
+
+        (res = res, time_s = stats.time, cfg = cfg)
+    end
+end
+
+sir_results = Dict{String, Any}()
+for (label, t) in sir_tasks
+    sir_results[label] = fetch(t)
+    r = sir_results[label]
+    @printf("\n  [SIR %s] Wall: %.1fs  Data MSE: %.4e  ODE MSE: %.4e\n",
+            label, r.time_s, r.res.metrics.data_mse, r.res.metrics.ode_mse)
+    @printf("  [SIR %s] β = %.3f (true 1.5)  γ = %.3f (true 1.0)\n",
+            label, r.res.params.ODE_par.β, r.res.params.ODE_par.γ)
+end
+#+end_src
+
+#+RESULTS:
+
+* Baccam model
+
+** True ODE and noisy data
+
+The Baccam model has states spanning ~10 orders of magnitude and uses a
+LogTransform.  This is where the hardwired IC + log interaction should
+bite hardest.
+
+True parameters: β = 2.7e-5, δ = 4.0, p = 1.2e-2, c = 3.0, y₀ = [4e8, 0, 9.3e-2].
+
+#+begin_src julia-vterm
+
+function Baccam_model!(du, u, p, t)
+    T, I, V = u
+    du[1] = -p.β * T * V
+    du[2] =  p.β * T * V - p.δ * I
+    du[3] =  p.p * I     - p.c * V
+end
+
+bac_true_params = (β = 2.7f-5, δ = 4.0f0, p = 1.2f-2, c = 3.0f0)
+bac_u0     = Float32[4.0f8, 0.0f0, 9.3f-2]
+bac_t_span = (0.0f0, 8.0f0)
+bac_t_fine = collect(range(bac_t_span[1], bac_t_span[2], length = 2001))
+
+bac_sol = solve(
+    ODEProblem(Baccam_model!, bac_u0, bac_t_span, bac_true_params),
+    Tsit5(); saveat = bac_t_fine
+)
+bac_sol_array = Array(bac_sol)
+
+println("Baccam ODE solved: $(size(bac_sol_array))")
+println("State ranges:  T=[$(extrema(bac_sol_array[1,:]))]")
+println("               I=[$(extrema(bac_sol_array[2,:]))]")
+println("               V=[$(extrema(bac_sol_array[3,:]))]")
+#+end_src
+
+#+RESULTS:
+: Baccam ODE solved: (3, 2001)
+: State ranges:  T=[(8176.1836f0, 4.0f8)]
+:                I=[(0.0f0, 1.5729f8)]
+:                V=[(0.073235795f0, 422674.88f0)]
+
+#+begin_src julia-vterm
+
+rng_bac = MersenneTwister(42)
+bac_noise_σ = 0.5f0
+bac_n_tp    = 10
+bac_n_mice  = 12
+
+bac_idx   = round.(Int, range(1, length(bac_t_fine), length = bac_n_tp))
+bac_t_obs = Float32.(bac_t_fine[bac_idx])
+bac_Y_true = Float32.(bac_sol_array[:, bac_idx])
+
+bac_ε = randn(rng_bac, Float32, 3, bac_n_tp, bac_n_mice)
+bac_Y_noisy = clamp.(
+    bac_Y_true .* exp.(bac_noise_σ .* bac_ε .- 0.5f0 * bac_noise_σ^2),
+    0f0, Inf32
+)
+bac_Y_mean = dropdims(mean(bac_Y_noisy; dims = 3); dims = 3)
+
+println("Baccam training data: $(bac_n_tp) timepoints × $(bac_n_mice) mice")
+println("Y_mean shape: $(size(bac_Y_mean))")
+#+end_src
+
+#+RESULTS:
+: Baccam training data: 10 timepoints × 12 mice
+: Y_mean shape: (3, 10)
+
+** Architecture definitions
+
+#+begin_src julia-vterm :results nil
+
+struct BaccamParams{T<:AbstractFloat}
+    β::T
+    δ::T
+    c::T
+end
+BaccamParams(nt::ComponentVector) = BaccamParams(nt.β, nt.δ, nt.c)
+
+function BaccamArchitectureRaw(y::AbstractMatrix{<:Real},
+                               g::AbstractMatrix{<:Real},
+                               p::BaccamParams)
+    T, I, V = y[1,:], y[2,:], y[3,:]
+    g_T, g_V = g[1,:], g[2,:]
+    dT = g_T
+    dI = p.β .* T .* V .- p.δ .* I
+    dV = g_V .- p.c .* V
+    return permutedims(hcat(dT, dI, dV))
+end
+
+bac_build_state_mlp() = Lux.Chain(
+    Lux.Dense(1, 8, tanh_fast),
+    Lux.Dense(8, 6, tanh_fast),
+    Lux.Dense(6, 3),
+)
+
+bac_build_g_mlp() = Lux.Chain(
+    Lux.Dense(1, 6, tanh_fast),
+    Lux.Dense(6, 4, tanh_fast),
+    Lux.Dense(4, 2),
+)
+#+end_src
+
+#+RESULTS:
+
+** Transform and data packing
+
+#+begin_src julia-vterm :results nil
+
+# bac_transform = LogTransform(
+#     10f0,
+#     Float32[1f-2, 1f-2, 1f-2],
+#     Bool[true, true, true],
+# )
+
+log_tr = LogTransform(10f0, Float32[1f-2, 1f-2, 1f-2], Bool[true, true, true])
+
+Y_log  = forward_state(log_tr, bac_Y_mean)
+μ_log  = vec(mean(Y_log; dims=2))
+σ_log  = vec(max.(std(Y_log; dims=2), 1f-6))
+
+bac_transform = ComposedTransform(log_tr, ZScoreTransform(μ_log, σ_log))
+
+bac_t_train = permutedims(bac_t_obs)
+bac_t_dense = permutedims(Float32.(range(
+    minimum(bac_t_obs), maximum(bac_t_obs); length = 1000)))
+bac_t_span_vec = Float32[minimum(bac_t_obs), maximum(bac_t_obs)]
+
+bac_data = (
+    t_train        = bac_t_train,
+    Y_train        = bac_Y_mean,
+    Y_train_std    = ones(Float32, 3, 1),
+    t_dense        = bac_t_dense,
+    t_span         = bac_t_span_vec,
+    y0_init        = bac_u0,
+    ODE_par_init   = (β = 1f-4, δ = 1f0, c = 1f0),
+    ODE_par_bounds = (β = Float32[0, 1f-2], δ = Float32[0, 20], c = Float32[0, 20]),
+)
+#+end_src
+
+#+RESULTS:
+
+** Hyperparameters
+
+Tuned separately from SIR — the Baccam model needs different balance
+between data and ODE terms due to the log transform.
+
+#+begin_src julia-vterm :results nil
+
+#                           ϵ_ic    ϵ_ode   ϵ_Data  ϵ_L1_s  ϵ_L1_g
+bac_hp_soft = HyperParams(  0.0f0,  0.1f0,  4f-04,  0.5f0,  0.5f0)
+bac_hp_hard = HyperParams(  0.0f0,  1f-04,  4f-04,  0.5f0,  0.5f0)
+
+bac_maxiters_s1 = 50_000
+bac_maxiters_s2 = 120_000
+bac_lr = 1f-4
+#+end_src
+
+#+RESULTS:
+
+** Mode configurations
+
+#+begin_src julia-vterm :results nil
+
+bac_t_max = bac_t_span_vec[2]
+
+bac_mode_configs = Dict(
+    "soft_ic" => (
+        arch_mode = LuxMLP(),
+        hp        = bac_hp_soft,
+    ),
+    "hardwired_linear" => (
+        arch_mode = LuxMLPHardwiredIC(),
+        hp        = bac_hp_hard,
+    ),
+    "hardwired_tanh" => (
+        arch_mode = LuxMLPTanhIC(a = 2f0 / bac_t_max),
+        hp        = bac_hp_hard,
+    ),
+    "hardwired_power" => (
+        arch_mode = LuxMLPPowerIC(α = 0.5f0, t_c = bac_t_max / 2f0),
+        hp        = bac_hp_hard,
+    ),
+)
+#+end_src
+
+#+RESULTS:
+
+** Training (parallel)
+
+#+begin_src julia-vterm
+
+bac_tasks = Dict{String, Task}()
+for (label, cfg) in bac_mode_configs
+    bac_tasks[label] = Threads.@spawn begin
+        println("[Thread $(Threads.threadid())] Baccam — Starting $label")
+
+        stats = @timed res = train(
+            FixedHyper(),
+            bac_data,
+            BaccamArchitectureRaw,
+            BaccamParams,
+            cfg.hp;
+            transform       = bac_transform,
+            arch_mode       = cfg.arch_mode,
+            seed            = 1,
+            maxiters_stage1 = bac_maxiters_s1,
+            maxiters_stage2 = bac_maxiters_s2,
+            Opt_alg_stage1  = OptimizationOptimisers.Adam(bac_lr),
+            Opt_alg_stage2  = OptimizationOptimisers.Adam(bac_lr),
+            build_state_mlp = bac_build_state_mlp,
+            build_g_mlp     = bac_build_g_mlp,
+        )
+
+        (res = res, time_s = stats.time, cfg = cfg)
+    end
+end
+
+bac_results = Dict{String, Any}()
+for (label, t) in bac_tasks
+    bac_results[label] = fetch(t)
+    r = bac_results[label]
+    @printf("\n  [Baccam %s] Wall: %.1fs  Data MSE: %.4e  ODE MSE: %.4e\n",
+            label, r.time_s, r.res.metrics.data_mse, r.res.metrics.ode_mse)
+    @printf("  [Baccam %s] β = %.2e (true 2.7e-5)  δ = %.3f (true 4.0)  c = %.3f (true 3.0)\n",
+            label, r.res.params.ODE_par.β, r.res.params.ODE_par.δ, r.res.params.ODE_par.c)
+end
+#+end_src
+
+#+RESULTS:
+
+* Diagnostics
+
+** Summary tables
+
+#+begin_src julia-vterm
+
+println("="^90)
+println("  SIR — Comparison across IC modes")
+println("="^90)
+@printf("%-20s  %-10s  %-10s  %-12s  %-12s\n",
+        "Mode", "β (1.5)", "γ (1.0)", "Data MSE", "ODE MSE")
+println("-"^70)
+
+for label in ["soft_ic", "hardwired_linear", "hardwired_tanh", "hardwired_power"]
+    r = sir_results[label].res
+    @printf("%-20s  β=%.3f   γ=%.3f   %.4e  %.4e\n",
+            label, r.params.ODE_par.β, r.params.ODE_par.γ,
+            r.metrics.data_mse, r.metrics.ode_mse)
+end
+
+println()
+println("="^90)
+println("  Baccam — Comparison across IC modes")
+println("="^90)
+@printf("%-20s  %-14s  %-10s  %-10s  %-12s  %-12s\n",
+        "Mode", "β (2.7e-5)", "δ (4.0)", "c (3.0)", "Data MSE", "ODE MSE")
+println("-"^90)
+
+for label in ["soft_ic", "hardwired_linear", "hardwired_tanh", "hardwired_power"]
+    r = bac_results[label].res
+    @printf("%-20s  β=%.2e   δ=%.3f   c=%.3f   %.4e  %.4e\n",
+            label, r.params.ODE_par.β, r.params.ODE_par.δ, r.params.ODE_par.c,
+            r.metrics.data_mse, r.metrics.ode_mse)
+end
+#+end_src
+
+** IC satisfaction comparison
+
+The hardwired modes should all satisfy z(0) = z₀ exactly; the soft IC
+mode satisfies it approximately.  Checking both models confirms the
+structural guarantee holds regardless of transform.
+
+#+begin_src julia-vterm
+
+for (model_name, results, transform, u0) in [
+    ("SIR",    sir_results, sir_transform, sir_u0),
+    ("Baccam", bac_results, bac_transform, bac_u0),
+]
+    y0_trans = forward_state(transform, u0)
+    println("\n── $model_name  (z₀ = $(round.(y0_trans; digits=3))) ──")
+
+    for label in ["soft_ic", "hardwired_linear", "hardwired_tanh", "hardwired_power"]
+        r   = results[label]
+        ps  = r.res.params
+        ctx = r.res.ctx2
+
+        ŷ0 = ctx.predict_state(ps, Float32[0f0;;])
+        err = maximum(abs.(vec(ŷ0) .- y0_trans))
+        @printf("  %-20s  max|ŷ(0) - z₀| = %.2e\n", label, err)
+    end
+end
+#+end_src
+
+* Visualisation
+
+** State trajectory fits
+
+Each row is a model (SIR / Baccam), each column an IC mode.
+Subplots show all state variables overlaid.
+
+#+begin_src julia-vterm
+
+mode_order  = ["soft_ic", "hardwired_linear", "hardwired_tanh", "hardwired_power"]
+mode_labels = ["Soft IC", "Hardwired (t)", "Tanh ramp", "Power ramp"]
+
+fig = Figure(size = (1200, 900), fontsize = 11)
+
+# ── Row 1–3: SIR states ──
+sir_state_labels = ["S(t)", "I(t)", "R(t)"]
+sir_t_eval = permutedims(Float32.(range(sir_t_span[1], sir_t_span[2]; length = 300)))
+
+for (col, (mode_key, mode_label)) in enumerate(zip(mode_order, mode_labels))
+    r   = sir_results[mode_key]
+    ps  = r.res.params
+    ctx = r.res.ctx2
+
+    ŷ_trans = ctx.predict_state(ps, sir_t_eval)
+    ŷ_raw  = inverse_state(sir_transform, ŷ_trans)
+
+    for si in 1:3
+        ax = Makie.Axis(fig[si, col];
+            title  = si == 1 ? mode_label : "",
+            ylabel = col == 1 ? "SIR — $(sir_state_labels[si])" : "",
+            xlabel = si == 3 ? "t" : "",
+            xgridvisible = true, ygridvisible = true,
+            topspinevisible = false, rightspinevisible = false,
+            xticklabelsize = 8, yticklabelsize = 8,
+        )
+
+        lines!(ax, sir_t_fine, sir_sol_array[si, :];
+            color = :grey60, linewidth = 1.5, linestyle = :dash)
+        lines!(ax, vec(sir_t_eval), ŷ_raw[si, :];
+            color = :royalblue, linewidth = 2)
+        scatter!(ax, sir_t_obs, sir_Y_mean[si, :];
+            color = :black, markersize = 5)
+    end
+end
+
+# ── Row 4–6: Baccam states ──
+bac_state_labels = ["T(t)", "I(t)", "V(t)"]
+bac_t_eval = permutedims(Float32.(range(bac_t_span[1], bac_t_span[2]; length = 300)))
+bac_plot_floor = 1f-2
+
+for (col, (mode_key, mode_label)) in enumerate(zip(mode_order, mode_labels))
+    r   = bac_results[mode_key]
+    ps  = r.res.params
+    ctx = r.res.ctx2
+
+    ŷ_trans = ctx.predict_state(ps, bac_t_eval)
+    ŷ_raw  = inverse_state(bac_transform, ŷ_trans)
+
+    for si in 1:3
+        ax = Makie.Axis(fig[si + 3, col];
+            ylabel = col == 1 ? "Baccam — $(bac_state_labels[si])" : "",
+            xlabel = si == 3 ? "Days p.i." : "",
+            yscale = Makie.log10,
+            xgridvisible = true, ygridvisible = true,
+            topspinevisible = false, rightspinevisible = false,
+            xticklabelsize = 8, yticklabelsize = 8,
+        )
+
+        lines!(ax, bac_t_fine, bac_sol_array[si, :] .+ bac_plot_floor;
+            color = :grey60, linewidth = 1.5, linestyle = :dash)
+        lines!(ax, vec(bac_t_eval), ŷ_raw[si, :] .+ bac_plot_floor;
+            color = :firebrick, linewidth = 2)
+        scatter!(ax, bac_t_obs, bac_Y_mean[si, :] .+ bac_plot_floor;
+            color = :black, markersize = 5)
+    end
+end
+
+Legend(fig[7, 1:4],
+    [LineElement(color = :grey60, linewidth = 1.5, linestyle = :dash),
+     LineElement(color = :royalblue, linewidth = 2),
+     LineElement(color = :firebrick, linewidth = 2),
+     MarkerElement(marker = :circle, markersize = 7, color = :black)],
+    ["True ODE", "SIR fit", "Baccam fit", "Training data"],
+    orientation = :horizontal, tellwidth = false)
+
+display(fig)
+#+end_src
+
+#+RESULTS:
+
+** IC residual near t = 0
+
+Shows ŷ(t) − z₀ in transformed coordinates near t = 0 for all
+modes. Hardwired modes should be exactly 0 at t = 0; the ramp shape
+controls how quickly the network "turns on."
+
+#+begin_src julia-vterm
+
+fig_ic = Figure(size = (1200, 500), fontsize = 11)
+
+mode_colors = Dict(
+    "soft_ic"           => :grey40,
+    "hardwired_linear"  => :royalblue,
+    "hardwired_tanh"    => :firebrick,
+    "hardwired_power"   => :forestgreen,
+)
+
+for (model_idx, (model_name, results, transform, u0, state_labels, t_max)) in enumerate([
+    ("SIR",    sir_results, sir_transform, sir_u0, sir_state_labels, sir_t_span[2]),
+    ("Baccam", bac_results, bac_transform, bac_u0, bac_state_labels, bac_t_span[2]),
+])
+    y0_trans = forward_state(transform, u0)
+    t_near = permutedims(Float32.(range(0f0, t_max * 0.15f0; length = 100)))
+
+    for si in 1:3
+        row = (model_idx - 1) * 1 + model_idx  # row 1 for SIR, row 3 for Baccam (with label row)
+        ax = Makie.Axis(fig_ic[model_idx, si];
+            title  = model_idx == 1 ? state_labels[si] : "",
+            xlabel = model_idx == 2 ? "t" : "",
+            ylabel = si == 1 ? model_name : "",
+            xgridvisible = true, ygridvisible = true,
+            topspinevisible = false, rightspinevisible = false,
+            xticklabelsize = 8, yticklabelsize = 8,
+        )
+        hlines!(ax, [0f0]; color = :grey80, linewidth = 1)
+
+        for label in mode_order
+            r   = results[label]
+            ps  = r.res.params
+            ctx = r.res.ctx2
+
+            ŷ = ctx.predict_state(ps, t_near)
+            residual = ŷ[si, :] .- y0_trans[si]
+
+            lines!(ax, vec(t_near), vec(residual);
+                color = mode_colors[label], linewidth = 1.5)
+        end
+    end
+end
+
+Legend(fig_ic[3, 1:3],
+    [LineElement(color = mode_colors[k], linewidth = 1.5) for k in mode_order],
+    mode_labels,
+    orientation = :horizontal, tellwidth = false)
+
+Label(fig_ic[0, 1:3],
+    "IC residual: ŷ(t) − z₀ near t = 0 (transformed coordinates)";
+    fontsize = 13, tellwidth = false)
+
+display(fig_ic)
+#+end_src
+
+#+RESULTS:
+
+** Learned g-functions
+
+#+begin_src julia-vterm
+
+fig_g = Figure(size = (1200, 500), fontsize = 11)
+
+# SIR: g_S, g_R
+for gi in 1:2
+    g_label = gi == 1 ? "g_S" : "g_R"
+    ax = Makie.Axis(fig_g[1, gi];
+        title  = "SIR — $g_label",
+        xlabel = "t",
+        xgridvisible = true, ygridvisible = true,
+        topspinevisible = false, rightspinevisible = false,
+    )
+
+    for label in mode_order
+        r   = sir_results[label]
+        ps  = r.res.params
+        ctx = r.res.ctx2
+        ĝ   = ctx.predict_g(ps, sir_t_eval)
+        lines!(ax, vec(sir_t_eval), vec(ĝ[gi, :]);
+            color = mode_colors[label], linewidth = 1.5, label = label)
+    end
+    gi == 1 && axislegend(ax; position = :rb, labelsize = 8)
+end
+
+# Baccam: g_T, g_V
+for gi in 1:2
+    g_label = gi == 1 ? "g_T" : "g_V"
+    ax = Makie.Axis(fig_g[2, gi];
+        title  = "Baccam — $g_label",
+        xlabel = "Days p.i.",
+        xgridvisible = true, ygridvisible = true,
+        topspinevisible = false, rightspinevisible = false,
+    )
+
+    for label in mode_order
+        r   = bac_results[label]
+        ps  = r.res.params
+        ctx = r.res.ctx2
+        ĝ   = ctx.predict_g(ps, bac_t_eval)
+        lines!(ax, vec(bac_t_eval), vec(ĝ[gi, :]);
+            color = mode_colors[label], linewidth = 1.5, label = label)
+    end
+end
+
+Label(fig_g[0, 1:2],
+    "Learned g-functions across IC modes";
+    fontsize = 13, tellwidth = false)
+
+display(fig_g)
+#+end_src
+
+#+RESULTS:
+
+* Summary
+
+#+begin_src julia-vterm
+
+println("\n", "="^70)
+println("  Cross-model IC Mode Comparison")
+println("="^70)
+
+for (model_name, results, true_params_str) in [
+    ("SIR",    sir_results, "β=1.5, γ=1.0"),
+    ("Baccam", bac_results, "β=2.7e-5, δ=4.0, c=3.0"),
+]
+    println("\n── $model_name (true: $true_params_str) ──")
+    @printf("  %-20s  %-12s  %-12s  %-10s\n",
+            "Mode", "Data MSE", "ODE MSE", "Wall (s)")
+    println("  ", "-"^60)
+
+    for label in mode_order
+        r = results[label]
+        @printf("  %-20s  %.4e  %.4e  %8.1f\n",
+                label, r.res.metrics.data_mse, r.res.metrics.ode_mse, r.time_s)
+    end
+end
+
+println("\n\nExpected pattern:")
+println("  • SIR: all modes similar (ZScore transform, states ~O(1))")
+println("  • Baccam hardwired_linear: worst (1/t singularity under log transform)")
+println("  • Baccam hardwired_tanh: improved (saturating ramp avoids worst of singularity)")
+println("  • Baccam hardwired_power: potentially best hardwired (sublinear ramp near t=0)")
+#+end_src#+title:
