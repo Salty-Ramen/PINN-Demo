@@ -1,14 +1,13 @@
 #!/usr/bin/env julia
 #
-# run_single_baccam_hardwired.jl
+# run_single_baccam.jl — Composite transform sweep worker
 #
-# Trains one hyperparameter combination on the B_10x12 data using
-# the LuxMLPHardwiredIC architecture.  Writes scalar metrics,
-# trajectory predictions, and training loss history into a
-# per-worker HDF5 file.
+# Trains one (config, hyperparameter) combination using the
+# ComposedTransform (Log₁₀ + ZScore) and writes results to
+# a per-worker HDF5 file.
 #
 # Called by GNU Parallel:
-#   julia --project=. run_single_baccam_hardwired.jl <config_key> <hp_index> <script_dir>
+#   julia --project=. run_single_baccam.jl <config_key> <hp_index> <script_dir>
 
 using Pkg; Pkg.activate(".")
 
@@ -24,7 +23,7 @@ using Printf
 # ── Shared config ─────────────────────────────────────────
 
 const SCRIPT_DIR = length(ARGS) >= 3 ? ARGS[3] :
-    joinpath(pwd(), "Experiments", "HardwiredIC-sweep")
+    joinpath(pwd(), "Experiments", "CompositeTransform-sweep")
 
 include(joinpath(SCRIPT_DIR, "sweep_config.jl"))
 
@@ -33,7 +32,9 @@ include(joinpath(SCRIPT_DIR, "sweep_config.jl"))
 # ══════════════════════════════════════════════════════════
 
 if length(ARGS) < 2
-    error("Usage: run_single_baccam_hardwired.jl <config_key> <hp_index> [script_dir]")
+    error("Usage: run_single_baccam.jl <config_key> <hp_index> [script_dir]\n" *
+          "  config_key : A_5x24 | B_10x12 | C_20x6\n" *
+          "  hp_index   : 1..$(length(HP_GRID))")
 end
 
 const CFG_KEY = ARGS[1]
@@ -74,6 +75,9 @@ t_dense    = permutedims(Float32.(range(
     minimum(t_all), maximum(t_all); length = 1000)))
 t_span_vec = Float32[minimum(t_all), maximum(t_all)]
 
+# Build the composed transform from this config's training data
+state_transform = build_composed_transform(Y_all)
+
 data = (
     t_train        = t_train,
     Y_train        = Y_all,
@@ -107,8 +111,6 @@ function BaccamArchitectureRaw(y::AbstractMatrix{<:Real},
     return permutedims(hcat(dT, dI, dV))
 end
 
-# Unbounded output — the hardwired reparameterization
-# ŷ(t) = y₀ + t·NN(t,θ) needs signed departures
 build_state_mlp() = Lux.Chain(
     Lux.Dense(1, 8, tanh_fast),
     Lux.Dense(8, 6, tanh_fast),
@@ -122,7 +124,7 @@ build_g_mlp() = Lux.Chain(
 )
 
 # ══════════════════════════════════════════════════════════
-# 4. Callback — early stopping + loss history accumulation
+# 4. Callback — early stopping + loss history
 # ══════════════════════════════════════════════════════════
 
 function make_sweep_callback(label; patience=600, min_delta=1f-7, log_every=25)
@@ -150,7 +152,6 @@ function make_sweep_callback(label; patience=600, min_delta=1f-7, log_every=25)
         push!(hist.data_mse, d_mse)
         push!(hist.ode_mse, o_mse)
 
-        # Early stopping on combined loss (Stage 2 only)
         if ctx isa PINNCtxStage2
             combined = d_mse + o_mse
             if combined < best[] - min_delta
@@ -176,7 +177,7 @@ end
 # ══════════════════════════════════════════════════════════
 
 run_label = "$(CFG_KEY)_hp$(HP_IDX)"
-println("Starting $run_label  [HardwiredIC]  " *
+println("Starting $run_label  [HardwiredIC + ComposedTransform]  " *
         "(ϵ_ode=$(hp.ϵ_ode), ϵ_Data=$(hp.ϵ_Data), " *
         "ϵ_L1s=$(hp.ϵ_L1_state), ϵ_L1g=$(hp.ϵ_L1_g))")
 
@@ -191,7 +192,7 @@ res = try
         BaccamArchitectureRaw,
         BaccamParams,
         hp;
-        transform           = STATE_TRANSFORM,
+        transform           = state_transform,
         arch_mode           = LuxMLPHardwiredIC(),
         user_loss_functions = Function[],
         seed                = 1,
@@ -243,7 +244,6 @@ function write_result_h5(path, cfg_key, hp_idx, hp, res, wall_t, transform, loss
             g_sc["converged"]       = true
         end
 
-        # Partial loss curves are useful even for failed runs
         if !isempty(loss_hist.iter)
             g_diag = create_group(fid, "diagnostics")
             g_diag["iter"]     = loss_hist.iter
@@ -253,7 +253,6 @@ function write_result_h5(path, cfg_key, hp_idx, hp, res, wall_t, transform, loss
 
         isnothing(res) && return
 
-        # Evaluate trained model on a uniform grid
         t_eval = permutedims(Float32.(range(
             minimum(data.t_train), maximum(data.t_train);
             length = N_TRAJ_EVAL)))
@@ -272,7 +271,7 @@ function write_result_h5(path, cfg_key, hp_idx, hp, res, wall_t, transform, loss
     end
 end
 
-write_result_h5(OUTFILE, CFG_KEY, HP_IDX, hp, res, wall_t, STATE_TRANSFORM, loss_hist)
+write_result_h5(OUTFILE, CFG_KEY, HP_IDX, hp, res, wall_t, state_transform, loss_hist)
 
 if isnothing(res)
     @printf("FAILED %s — wrote %s (%.0fs)\n", run_label, OUTFILE, wall_t)

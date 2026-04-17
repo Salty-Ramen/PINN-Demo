@@ -1,13 +1,14 @@
 #!/usr/bin/env julia
 #
-# Baccam_hardwired_sweep_analysis.jl
+# Baccam_sweep_analysis.jl — Composite transform sweep
 #
 # Merges per-worker HDF5 files into a master HDF5 and generates
-# diagnostic plots for the HardwiredIC architecture sweep.
+# diagnostic plots.  Handles all three sampling configs
+# (A_5x24, B_10x12, C_20x6).
 #
 # Usage:
-#   julia --project=. Baccam_hardwired_sweep_analysis.jl [results_dir]
-#   julia --project=. Baccam_hardwired_sweep_analysis.jl [results_dir] --master path/to/master.h5
+#   julia --project=. Baccam_sweep_analysis.jl [results_dir]
+#   julia --project=. Baccam_sweep_analysis.jl [results_dir] --master path/to/master.h5
 
 using Pkg; Pkg.activate(".")
 
@@ -22,7 +23,7 @@ using OrdinaryDiffEq
 # ══════════════════════════════════════════════════════════
 
 function parse_cli(args)
-    results_dir = joinpath(pwd(), "Experiments", "Baccam-Hardwired-IC-Exploration", "Results")
+    results_dir = joinpath(pwd(), "Experiments", "CompositeTransform-sweep", "Results")
     master_override = nothing
     i = 1
     while i <= length(args)
@@ -41,7 +42,7 @@ end
 const RESULTS_DIR, MASTER_OVERRIDE = parse_cli(ARGS)
 const ROW_DIR   = joinpath(RESULTS_DIR, "sweep_rows")
 const MASTER_H5 = isnothing(MASTER_OVERRIDE) ?
-    joinpath(RESULTS_DIR, "Baccam_hardwired_hp_sweep.h5") : MASTER_OVERRIDE
+    joinpath(RESULTS_DIR, "Baccam_composite_hp_sweep.h5") : MASTER_OVERRIDE
 
 # ══════════════════════════════════════════════════════════
 # 1. Merge / load
@@ -89,7 +90,6 @@ function merge_sweep_rows(row_dir, master_path, results_dir)
             push!(rows, row)
         end
 
-        # Columnar scalar storage
         g_sc_merged = create_group(master, "scalars")
         for k in SCALAR_KEYS
             vals = [get(r, k, missing) for r in rows]
@@ -97,7 +97,6 @@ function merge_sweep_rows(row_dir, master_path, results_dir)
             g_sc_merged[k] = collect(vals)
         end
 
-        # Copy metadata if present
         meta_path = joinpath(results_dir, "sweep_metadata.h5")
         if isfile(meta_path)
             h5open(meta_path, "r") do mfid
@@ -135,7 +134,6 @@ df_all = isnothing(MASTER_OVERRIDE) ?
     merge_sweep_rows(ROW_DIR, MASTER_H5, RESULTS_DIR) :
     load_master_h5(MASTER_H5)
 
-# Rename columns to Unicode
 for (old, new) in ["eps_ic"=>"ϵ_ic", "eps_ode"=>"ϵ_ode", "eps_Data"=>"ϵ_Data",
                     "eps_L1_state"=>"ϵ_L1_state", "eps_L1_g"=>"ϵ_L1_g",
                     "beta_recovered"=>"β_recovered", "delta_recovered"=>"δ_recovered"]
@@ -184,6 +182,10 @@ function select_pareto_top(sub, n)
     return first(sort(ps, :nadir_dist; rev=true), min(n, nrow(ps)))
 end
 
+function nadir_scores_all(sub)
+    return _nadir_scores(sub.data_mse, sub.ode_mse)
+end
+
 # ══════════════════════════════════════════════════════════
 # Reference ODE
 # ══════════════════════════════════════════════════════════
@@ -207,113 +209,145 @@ sol_true    = solve(
     Tsit5(); saveat = t_fine)
 sol_array = Array(sol_true)
 
+const config_keys  = sort(unique(df.config))
+const config_colors = Dict(
+    "A_5x24"  => :royalblue,
+    "B_10x12" => :darkorange,
+    "C_20x6"  => :forestgreen,
+)
+
 # ══════════════════════════════════════════════════════════
-# 2. Pareto front plot
+# 2. Pareto front: Data MSE vs ODE MSE
 # ══════════════════════════════════════════════════════════
 
-fig1 = Figure(size = (500, 450), fontsize = 12)
-ax = Makie.Axis(fig1[1, 1];
-    title = "B_10x12 — HardwiredIC", xlabel = "Data MSE", ylabel = "ODE MSE",
-    xscale = log10, yscale = log10,
-    topspinevisible = false, rightspinevisible = false)
+fig1 = Figure(size = (1000, 400), fontsize = 12)
 
-scatter!(ax, df.data_mse, df.ode_mse;
-    color = :darkorange, markersize = 6, alpha = 0.6)
+for (col, cfg) in enumerate(config_keys)
+    sub = filter(r -> r.config == cfg, df)
+    ax = Makie.Axis(fig1[1, col];
+        title  = cfg,
+        xlabel = "Data MSE",
+        ylabel = col == 1 ? "ODE MSE" : "",
+        xscale = log10, yscale = log10,
+        xgridvisible = true, ygridvisible = true,
+        topspinevisible = false, rightspinevisible = false)
 
-pmask = pareto_front_mask(df.data_mse, df.ode_mse)
-scatter!(ax, df.data_mse[pmask], df.ode_mse[pmask];
-    color = :red, markersize = 10, marker = :star5, label = "Pareto front")
+    scatter!(ax, sub.data_mse, sub.ode_mse;
+        color = config_colors[cfg], markersize = 6, alpha = 0.6)
 
-best = select_pareto_best(df)
-scatter!(ax, [best.data_mse], [best.ode_mse];
-    color = :gold, markersize = 14, marker = :diamond,
-    strokecolor = :black, strokewidth = 1.5, label = "Pareto best")
+    pmask = pareto_front_mask(sub.data_mse, sub.ode_mse)
+    scatter!(ax, sub.data_mse[pmask], sub.ode_mse[pmask];
+        color = :red, markersize = 10, marker = :star5, label = "Pareto front")
 
-axislegend(ax; position = :rt, labelsize = 9)
+    best = select_pareto_best(sub)
+    scatter!(ax, [best.data_mse], [best.ode_mse];
+        color = :gold, markersize = 14, marker = :diamond,
+        strokecolor = :black, strokewidth = 1.5, label = "Pareto best")
+
+    col == 1 && axislegend(ax; position = :rt, labelsize = 9)
+end
+
+Label(fig1[0, 1:length(config_keys)],
+    "Data MSE vs ODE MSE — ComposedTransform (Log₁₀ + ZScore)";
+    fontsize = 14, tellwidth = false)
 save(joinpath(RESULTS_DIR, "sweep_pareto.pdf"), fig1; px_per_unit = 600/72)
 
 # ══════════════════════════════════════════════════════════
-# 3. Parameter recovery
+# 3. Parameter recovery: Pareto-optimal runs per config
 # ══════════════════════════════════════════════════════════
 
 fig2 = Figure(size = (1000, 350), fontsize = 12)
-pareto_runs = df[pmask, :]
 
-for (col, (name, sym, truth)) in enumerate([
-        ("β", :β_recovered, TRUE_β),
-        ("δ", :δ_recovered, TRUE_δ),
-        ("c", :c_recovered, TRUE_c)])
+param_info = [
+    ("β", :β_recovered, TRUE_β),
+    ("δ", :δ_recovered, TRUE_δ),
+    ("c", :c_recovered, TRUE_c),
+]
 
+for (col, (name, sym, truth)) in enumerate(param_info)
     ax = Makie.Axis(fig2[1, col];
-        title = "Recovered $name (true = $truth)",
+        title  = "Recovered $name (true = $truth)",
+        xlabel = "Config",
         ylabel = col == 1 ? "Recovered value" : "",
+        xgridvisible = false, ygridvisible = true,
         topspinevisible = false, rightspinevisible = false)
 
-    vals = pareto_runs[!, sym]
-    scatter!(ax, 1.0 .+ 0.1 .* randn(length(vals)), vals;
-        color = (:darkorange, 0.6), markersize = 7)
-    hlines!(ax, [median(vals)]; color = :darkorange, linewidth = 2)
+    for (i, cfg) in enumerate(config_keys)
+        sub = filter(r -> r.config == cfg, df)
+        pmask = pareto_front_mask(sub.data_mse, sub.ode_mse)
+        vals = sub[pmask, sym]
+
+        xs = fill(Float64(i), length(vals)) .+ 0.1 .* randn(length(vals))
+        scatter!(ax, xs, vals;
+            color = (config_colors[cfg], 0.6), markersize = 7)
+        hlines!(ax, [median(vals)]; color = config_colors[cfg],
+            linewidth = 2, linestyle = :solid)
+    end
+
     hlines!(ax, [truth]; color = :black, linewidth = 1.5, linestyle = :dash)
-    ax.xticks = ([1], ["B_10x12"])
+    ax.xticks = (1:length(config_keys), config_keys)
 end
 
-Label(fig2[0, 1:3], "Parameter recovery — Pareto-optimal HardwiredIC runs";
+Label(fig2[0, 1:3],
+    "Parameter recovery — Pareto-optimal runs per config";
     fontsize = 14, tellwidth = false)
 save(joinpath(RESULTS_DIR, "sweep_param_recovery.pdf"), fig2; px_per_unit = 600/72)
 
 # ══════════════════════════════════════════════════════════
-# 4. Sensitivity triangle (4 active ϵ dimensions)
+# 4. Sensitivity heatmaps — pairwise triangle per config
 # ══════════════════════════════════════════════════════════
 
 const hp_names = ["ϵ_ode", "ϵ_Data", "ϵ_L1_state", "ϵ_L1_g"]
 const hp_syms  = Symbol.(hp_names)
 const N_HP     = length(hp_names)
 
-scores = _nadir_scores(df.data_mse, df.ode_mse)
+for cfg in config_keys
+    sub = filter(r -> r.config == cfg, df)
+    scores = nadir_scores_all(sub)
 
-fig_tri = Figure(size = (1000, 1000), fontsize = 10)
-Label(fig_tri[0, 1:N_HP],
-    "B_10x12 HardwiredIC — pairwise ϵ sensitivity"; fontsize = 14, tellwidth = false)
+    fig_tri = Figure(size = (1000, 1000), fontsize = 10)
+    Label(fig_tri[0, 1:N_HP], "$cfg — pairwise ϵ sensitivity (colour = nadir distance)";
+        fontsize = 14, tellwidth = false)
 
-for row in 1:N_HP, col in 1:N_HP
-    col > row && continue
+    for row in 1:N_HP, col in 1:N_HP
+        col > row && continue
 
-    if col == row
-        ax = Makie.Axis(fig_tri[row, col];
-            xlabel = row == N_HP ? hp_names[col] : "", xscale = log10,
-            topspinevisible = false, rightspinevisible = false,
-            xticklabelsize = 8, yticklabelsize = 8)
-        hist!(ax, df[!, hp_syms[col]]; bins = 25, color = (:darkorange, 0.6))
-        hideydecorations!(ax; grid = false)
-    else
-        ax = Makie.Axis(fig_tri[row, col];
-            xlabel = row == N_HP ? hp_names[col] : "",
-            ylabel = col == 1    ? hp_names[row] : "",
-            xscale = log10, yscale = log10,
-            topspinevisible = false, rightspinevisible = false,
-            xticklabelsize = 8, yticklabelsize = 8)
+        if col == row
+            ax = Makie.Axis(fig_tri[row, col];
+                xlabel = row == N_HP ? hp_names[col] : "", xscale = log10,
+                topspinevisible = false, rightspinevisible = false,
+                xticklabelsize = 8, yticklabelsize = 8)
+            hist!(ax, sub[!, hp_syms[col]]; bins = 25, color = (config_colors[cfg], 0.6))
+            hideydecorations!(ax; grid = false)
+        else
+            ax = Makie.Axis(fig_tri[row, col];
+                xlabel = row == N_HP ? hp_names[col] : "",
+                ylabel = col == 1    ? hp_names[row] : "",
+                xscale = log10, yscale = log10,
+                topspinevisible = false, rightspinevisible = false,
+                xticklabelsize = 8, yticklabelsize = 8)
 
-        sc = scatter!(ax, df[!, hp_syms[col]], df[!, hp_syms[row]];
-            color = scores, colormap = Reverse(:viridis),
-            markersize = 5, alpha = 0.7)
+            sc = scatter!(ax, sub[!, hp_syms[col]], sub[!, hp_syms[row]];
+                color = scores, colormap = Reverse(:viridis),
+                markersize = 5, alpha = 0.7)
 
-        # Shared colorbar in upper-right
-        row == 2 && col == 1 && Colorbar(fig_tri[1, N_HP], sc;
-            label = "Nadir dist (higher = better)", flipaxis = true)
+            if row == 2 && col == 1
+                Colorbar(fig_tri[1, N_HP], sc;
+                    label = "Nadir dist (higher = better)", flipaxis = true)
+            end
 
-        row != N_HP && hidexdecorations!(ax; grid = false)
-        col != 1    && hideydecorations!(ax; grid = false)
+            row != N_HP && hidexdecorations!(ax; grid = false)
+            col != 1    && hideydecorations!(ax; grid = false)
+        end
     end
+
+    save(joinpath(RESULTS_DIR, "sweep_sensitivity_triangle_$(cfg).pdf"),
+         fig_tri; px_per_unit = 600/72)
+    println("Saved triangle heatmap for $cfg")
 end
 
-save(joinpath(RESULTS_DIR, "sweep_sensitivity_triangle.pdf"), fig_tri; px_per_unit = 600/72)
-println("Saved sensitivity triangle")
-
 # ══════════════════════════════════════════════════════════
-# 5. Top-N trajectories
-#
-# A small floor is added to all plotted values so that
-# log10 doesn't choke on zeros (e.g. I(0) = 0).
+# 5. Top-N Pareto trajectories per config
 # ══════════════════════════════════════════════════════════
 
 const N_TOP = 5
@@ -321,110 +355,150 @@ const PLOT_FLOOR = 1f-2
 const state_labels = ["Target T(t)", "Infected I(t)", "Virus V(t)"]
 const obs_syms     = [:T_obs, :I_obs, :V_obs]
 
-top_runs = select_pareto_top(df, N_TOP)
+fig4 = Figure(size = (1200, 800), fontsize = 12)
 
-csv_path = joinpath(RESULTS_DIR, "Baccam_B_10x12.csv")
-df_data  = CSV.read(csv_path, DataFrame)
+for (col, cfg) in enumerate(config_keys)
+    sub = filter(r -> r.config == cfg, df)
+    top_runs = select_pareto_top(sub, N_TOP)
 
-unique_t  = sort(unique(df_data.t))
-box_width = length(unique_t) > 1 ? 0.6f0 * minimum(diff(unique_t)) : 0.3f0
+    csv_path = joinpath(RESULTS_DIR, "Baccam_$(cfg).csv")
+    df_data  = CSV.read(csv_path, DataFrame)
 
-fig4 = Figure(size = (500, 800), fontsize = 12)
+    unique_t  = sort(unique(df_data.t))
+    box_width = length(unique_t) > 1 ? 0.6f0 * minimum(diff(unique_t)) : 0.3f0
 
-for row in 1:3
-    ax = Makie.Axis(fig4[row, 1];
-        title  = state_labels[row],
-        xlabel = row == 3 ? "Days post-infection" : "",
-        ylabel = "Concentration",
-        yscale = Makie.log10,
-        topspinevisible = false, rightspinevisible = false)
+    for row in 1:3
+        ax = Makie.Axis(fig4[row, col];
+            title  = col == 1 ? state_labels[row] : "",
+            xlabel = row == 3 ? "Days post-infection" : "",
+            ylabel = col == 1 ? "Concentration" : "",
+            yscale = Makie.pseudolog10,
+            xgridvisible = true, ygridvisible = true,
+            topspinevisible = false, rightspinevisible = false,
+            xticklabelsize = 9, yticklabelsize = 9,
+            titlesize = 11, titlealign = :left)
 
-    lines!(ax, t_fine, sol_array[row, :] .+ PLOT_FLOOR;
-        color = :grey60, linewidth = 1.5, linestyle = :dash)
+        row == 1 && Label(fig4[0, col], cfg; fontsize = 13, tellwidth = false)
+
+        lines!(ax, t_fine, sol_array[row, :];
+            color = :grey60, linewidth = 1.5, linestyle = :dash)
+
+        nd_min, nd_max = extrema(top_runs.nadir_dist)
+        nd_range = max(nd_max - nd_min, 1e-12)
+
+        for r in eachrow(top_runs)
+            run_label = "$(r.config)_hp$(r.hp_idx)"
+            t_eval, y_hat = h5open(MASTER_H5, "r") do fid
+                g = fid["trajectories/$run_label"]
+                (read(g, "t_eval"), read(g, "state_pred"))
+            end
+            lines!(ax, t_eval, y_hat[row, :] .+ PLOT_FLOOR;
+                color = (r.nadir_dist - nd_min) / nd_range,
+                colorrange = (0.0, 1.0), colormap = Reverse(:viridis), linewidth = 2)
+        end
+
+        boxplot!(ax, df_data.t, df_data[!, obs_syms[row]];
+            width = box_width, color = (:grey80, 0.5),
+            whiskerwidth = 0.4, strokewidth = 0.8,
+            mediancolor = :black, medianlinewidth = 1.5,
+            outliercolor = (:black, 0.3), markersize = 3)
+    end
+end
+
+Colorbar(fig4[4, 3]; colormap = Reverse(:viridis), limits = (0.0, 1.0),
+    label = "Nadir distance (normalised, blue = best)",
+    vertical = false, flipaxis = false, tellwidth = false)
+Legend(fig4[4, 1:2],
+    [LineElement(color = :grey60, linewidth = 1.5, linestyle = :dash),
+     MarkerElement(marker = :rect, markersize = 12, color = (:grey80, 0.5),
+                   strokecolor = :black, strokewidth = 0.8)],
+    ["True ODE", "Mouse data (boxplot)"],
+    orientation = :horizontal, tellwidth = false)
+
+save(joinpath(RESULTS_DIR, "sweep_best_trajectories.pdf"), fig4; px_per_unit = 600/72)
+
+# ══════════════════════════════════════════════════════════
+# 6. Top-N g-functions per config
+# ══════════════════════════════════════════════════════════
+
+fig5 = Figure(size = (1200, 400), fontsize = 12)
+
+for (col, cfg) in enumerate(config_keys)
+    sub = filter(r -> r.config == cfg, df)
+    top_runs = select_pareto_top(sub, N_TOP)
+
+    ax1 = Makie.Axis(fig5[1, col];
+        title = "g_T  ($cfg)", xlabel = "Days p.i.",
+        xgridvisible = true, ygridvisible = true,
+        topspinevisible = false, rightspinevisible = false,
+        xticklabelsize = 9, yticklabelsize = 9, titlesize = 11, titlealign = :left)
+    ax2 = Makie.Axis(fig5[2, col];
+        title = "g_V  ($cfg)", xlabel = "Days p.i.",
+        xgridvisible = true, ygridvisible = true,
+        topspinevisible = false, rightspinevisible = false,
+        xticklabelsize = 9, yticklabelsize = 9, titlesize = 11, titlealign = :left)
 
     nd_min, nd_max = extrema(top_runs.nadir_dist)
     nd_range = max(nd_max - nd_min, 1e-12)
 
     for r in eachrow(top_runs)
-        t_eval, y_hat = h5open(MASTER_H5, "r") do fid
-            g = fid["trajectories/$(r.config)_hp$(r.hp_idx)"]
-            (read(g, "t_eval"), read(g, "state_pred"))
-        end
-        lines!(ax, t_eval, y_hat[row, :] .+ PLOT_FLOOR;
-            color = (r.nadir_dist - nd_min) / nd_range,
-            colorrange = (0.0, 1.0), colormap = Reverse(:viridis), linewidth = 2)
-    end
-
-    boxplot!(ax, df_data.t, df_data[!, obs_syms[row]] .+ PLOT_FLOOR;
-        width = box_width, color = (:grey80, 0.5),
-        whiskerwidth = 0.4, strokewidth = 0.8,
-        mediancolor = :black, medianlinewidth = 1.5,
-        outliercolor = (:black, 0.3), markersize = 3)
-end
-
-Colorbar(fig4[4, 1]; colormap = Reverse(:viridis), limits = (0.0, 1.0),
-    label = "Nadir dist (blue = best)", vertical = false, tellwidth = false)
-Legend(fig4[5, 1],
-    [LineElement(color = :grey60, linewidth = 1.5, linestyle = :dash),
-     MarkerElement(marker = :rect, markersize = 12, color = (:grey80, 0.5),
-                   strokecolor = :black, strokewidth = 0.8)],
-    ["True ODE", "Mouse data"], orientation = :horizontal, tellwidth = false)
-
-save(joinpath(RESULTS_DIR, "sweep_best_trajectories.pdf"), fig4; px_per_unit = 600/72)
-
-# ══════════════════════════════════════════════════════════
-# 6. Top-N g-functions
-# ══════════════════════════════════════════════════════════
-
-fig5 = Figure(size = (500, 400), fontsize = 12)
-
-nd_min, nd_max = extrema(top_runs.nadir_dist)
-nd_range = max(nd_max - nd_min, 1e-12)
-
-for (row, (gi, title)) in enumerate([(1, "g_T(t)"), (2, "g_V(t)")])
-    ax = Makie.Axis(fig5[row, 1];
-        title = title, xlabel = row == 2 ? "Days p.i." : "",
-        topspinevisible = false, rightspinevisible = false)
-
-    for r in eachrow(top_runs)
+        run_label = "$(r.config)_hp$(r.hp_idx)"
         t_eval, g_hat = h5open(MASTER_H5, "r") do fid
-            g = fid["trajectories/$(r.config)_hp$(r.hp_idx)"]
+            g = fid["trajectories/$run_label"]
             (read(g, "t_eval"), read(g, "g_pred"))
         end
-        lines!(ax, t_eval, vec(g_hat[gi, :]);
-            color = (r.nadir_dist - nd_min) / nd_range,
-            colorrange = (0.0, 1.0), colormap = Reverse(:viridis), linewidth = 2)
+        nd_frac = (r.nadir_dist - nd_min) / nd_range
+        lines!(ax1, t_eval, vec(g_hat[1, :]);
+            color = nd_frac, colorrange = (0.0, 1.0),
+            colormap = Reverse(:viridis), linewidth = 2)
+        lines!(ax2, t_eval, vec(g_hat[2, :]);
+            color = nd_frac, colorrange = (0.0, 1.0),
+            colormap = Reverse(:viridis), linewidth = 2)
     end
 end
 
-Label(fig5[0, 1], "Learned g(t,θ_g) — top $N_TOP HardwiredIC Pareto runs";
+Label(fig5[0, 1:3],
+    "Learned unknown physics g(t, θ_g) — top $N_TOP Pareto runs per config";
     fontsize = 14, tellwidth = false)
-Colorbar(fig5[3, 1]; colormap = Reverse(:viridis), limits = (0.0, 1.0),
-    label = "Nadir dist (blue = best)", vertical = false, tellwidth = false)
+Colorbar(fig5[3, 3]; colormap = Reverse(:viridis), limits = (0.0, 1.0),
+    label = "Nadir distance (normalised, blue = best)",
+    vertical = false, flipaxis = false, tellwidth = false)
 
 save(joinpath(RESULTS_DIR, "sweep_best_g_functions.pdf"), fig5; px_per_unit = 600/72)
 
 # ══════════════════════════════════════════════════════════
-# 7. Loss curve for Pareto-best run
+# 7. Loss curves for Pareto-best run per config
 # ══════════════════════════════════════════════════════════
 
-fig6 = Figure(size = (500, 350), fontsize = 12)
-best = select_pareto_best(df)
-run_label = "$(best.config)_hp$(best.hp_idx)"
+fig6 = Figure(size = (1200, 400), fontsize = 12)
 
-has_diag, iters, d_hist, o_hist = h5open(MASTER_H5, "r") do fid
-    p = "diagnostics/$run_label"
-    haskey(fid, p) || return (false, Int32[], Float32[], Float32[])
-    g = fid[p]
-    (true, read(g, "iter"), read(g, "data_mse"), read(g, "ode_mse"))
-end
+for (col, cfg) in enumerate(config_keys)
+    sub = filter(r -> r.config == cfg, df)
+    best = select_pareto_best(sub)
+    run_label = "$(best.config)_hp$(best.hp_idx)"
 
-ax = Makie.Axis(fig6[1, 1];
-    title = "Pareto-best (hp$(best.hp_idx))",
-    xlabel = "Iteration", ylabel = "Loss", yscale = Makie.log10,
-    topspinevisible = false, rightspinevisible = false)
+    has_diag, iters, d_hist, o_hist = h5open(MASTER_H5, "r") do fid
+        p = "diagnostics/$run_label"
+        haskey(fid, p) || return (false, Int32[], Float32[], Float32[])
+        g = fid[p]
+        (true, read(g, "iter"), read(g, "data_mse"), read(g, "ode_mse"))
+    end
 
-if has_diag
+    ax = Makie.Axis(fig6[1, col];
+        title  = "$cfg — Pareto-best (hp$(best.hp_idx))",
+        xlabel = "Iteration",
+        ylabel = col == 1 ? "Loss" : "",
+        yscale = Makie.log10,
+        xgridvisible = true, ygridvisible = true,
+        topspinevisible = false, rightspinevisible = false,
+        xticklabelsize = 9, yticklabelsize = 9, titlesize = 11, titlealign = :left)
+
+    if !has_diag
+        text!(ax, 0.5, 0.5; text = "No diagnostics",
+              align = (:center, :center), space = :relative)
+        continue
+    end
+
     s2_start = let idx = findfirst(!isnan, o_hist)
         isnothing(idx) ? nothing : iters[idx] end
     !isnothing(s2_start) && vlines!(ax, [s2_start]; color = :grey50, linestyle = :dash)
@@ -433,13 +507,12 @@ if has_diag
     omask = .!isnan.(o_hist)
     any(omask) && lines!(ax, iters[omask], o_hist[omask];
         color = :firebrick, linewidth = 1.5, label = "ODE MSE")
-    axislegend(ax; position = :rt, labelsize = 9)
-else
-    text!(ax, 0.5, 0.5; text = "No diagnostics",
-        align = (:center, :center), space = :relative)
+
+    col == 1 && axislegend(ax; position = :rt, labelsize = 9)
 end
 
-Label(fig6[0, 1], "Training loss — Pareto-best HardwiredIC run";
+Label(fig6[0, 1:length(config_keys)],
+    "Training loss curves — Pareto-best run per config";
     fontsize = 14, tellwidth = false)
 save(joinpath(RESULTS_DIR, "sweep_best_loss_curves.pdf"), fig6; px_per_unit = 600/72)
 
@@ -447,22 +520,31 @@ save(joinpath(RESULTS_DIR, "sweep_best_loss_curves.pdf"), fig6; px_per_unit = 60
 # 8. Ranked table
 # ══════════════════════════════════════════════════════════
 
-println("="^96)
-println("  Top 5 Pareto-optimal HardwiredIC runs (by nadir distance, descending)")
-println("="^96)
+println("="^100)
+println("  Top 5 Pareto-optimal runs per configuration (sorted by nadir distance, descending)")
+println("="^100)
 
-n_pareto = sum(pareto_front_mask(df.data_mse, df.ode_mse))
-top = select_pareto_top(df, 5)
+for cfg in config_keys
+    sub = filter(r -> r.config == cfg, df)
+    top = select_pareto_top(sub, 5)
 
-println("\n── B_10x12  ($n_pareto Pareto-optimal of $(nrow(df))) ──")
-@printf("  %-6s  %-10s  %-10s  %-10s  %-8s  %-8s  %-10s  %-10s  %-10s\n",
-        "hp_idx", "nadir_d", "ode_mse", "data_mse", "ϵ_ode", "ϵ_Data",
-        "β_rec", "δ_rec", "c_rec")
-println("  ", "-"^92)
-for r in eachrow(top)
-    @printf("  %-6d  %.3e  %.3e  %.3e  %-8.3f  %-8.3f  %.2e  %8.3f  %8.3f\n",
-            r.hp_idx, r.nadir_dist, r.ode_mse, r.data_mse, r.ϵ_ode, r.ϵ_Data,
-            r.β_recovered, r.δ_recovered, r.c_recovered)
+    n_pareto = sum(pareto_front_mask(sub.data_mse, sub.ode_mse))
+    println("\n── $cfg  ($n_pareto Pareto-optimal of $(nrow(sub))) ──")
+    @printf("  %-6s  %-10s  %-10s  %-10s  %-8s  %-8s  %-10s  %-10s  %-10s\n",
+            "hp_idx", "nadir_d", "ode_mse", "data_mse", "ϵ_ode", "ϵ_Data",
+            "β_rec", "δ_rec", "c_rec")
+    println("  ", "-"^96)
+    for r in eachrow(top)
+        @printf("  %-6d  %.3e  %.3e  %.3e  %-8.3f  %-8.3f  %.2e  %8.3f  %8.3f\n",
+                r.hp_idx, r.nadir_dist, r.ode_mse, r.data_mse, r.ϵ_ode, r.ϵ_Data,
+                r.β_recovered, r.δ_recovered, r.c_recovered)
+    end
 end
 
-println("\nPlots saved to $RESULTS_DIR")
+println("\nAll plots saved to $RESULTS_DIR")
+println("  sweep_pareto.pdf                        — Data vs ODE loss Pareto fronts")
+println("  sweep_param_recovery.pdf                — Recovered β, δ, c for Pareto-optimal runs")
+println("  sweep_sensitivity_triangle_<cfg>.pdf    — Full pairwise ϵ triangle heatmaps")
+println("  sweep_best_trajectories.pdf             — State fits from Pareto-best run per config")
+println("  sweep_best_g_functions.pdf              — Learned g_T, g_V from Pareto-best runs")
+println("  sweep_best_loss_curves.pdf              — Training loss curves from Pareto-best runs")
