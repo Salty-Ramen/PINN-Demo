@@ -1,9 +1,9 @@
 #!/usr/bin/env julia
 #
-# write_sweep_metadata.jl — Hardwired IC sweep
+# write_sweep_metadata.jl — Composite transform sweep
 #
-# Captures the sweep configuration and environment into HDF5
-# for reproducibility. Called once by run_sweep.sh before workers launch.
+# Captures sweep configuration and environment into HDF5
+# for reproducibility.  Called once by run_sweep.sh.
 #
 # Usage:
 #   julia --project=. write_sweep_metadata.jl <results_dir> <project_dir> <max_jobs>
@@ -43,7 +43,7 @@ h5open(OUTFILE, "w") do fid
     g["LHS_SEED"]  = LHS_SEED
     g["USE_LHS"]   = USE_LHS
     g["n_hp"]      = length(HP_GRID)
-    g["arch_mode"] = "LuxMLPHardwiredIC"
+    g["transform"]  = "ComposedTransform(Log10(shift=1e-2), ZScore)"
 
     gb = create_group(g, "HP_LOG_BOUNDS")
     for (k, v) in pairs(HP_LOG_BOUNDS)

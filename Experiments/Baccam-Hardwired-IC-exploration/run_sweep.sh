@@ -1,10 +1,9 @@
 #!/usr/bin/env bash
 #
-# run_sweep.sh — Hardwired IC hyperparameter sweep
+# run_sweep.sh — Composite transform (Log₁₀ + ZScore) hyperparameter sweep
 #
-# Orchestrates the sweep via GNU Parallel.  Each HP combination
+# Orchestrates the sweep via GNU Parallel.  Each (config, HP) pair
 # runs as an independent Julia process writing a per-worker HDF5.
-# Only the B_10x12 data config is used.
 #
 # Usage:
 #   chmod +x run_sweep.sh
@@ -48,12 +47,14 @@ echo "Precompiling project dependencies..."
 julia --project="${PROJECT_DIR}" -e 'using Pkg; Pkg.instantiate(); Pkg.precompile()'
 
 # ── Generate training data ────────────────────────────────
-if [[ ! -f "${RESULTS_DIR}/Baccam_B_10x12.csv" ]]; then
+if [[ ! -f "${RESULTS_DIR}/Baccam_A_5x24.csv" ]] || \
+   [[ ! -f "${RESULTS_DIR}/Baccam_B_10x12.csv" ]] || \
+   [[ ! -f "${RESULTS_DIR}/Baccam_C_20x6.csv" ]]; then
     echo "Generating training data into ${RESULTS_DIR}..."
     (cd "${PROJECT_DIR}" && julia --project="${PROJECT_DIR}" \
         "${SCRIPT_DIR}/generate_sweep_data.jl" "${RESULTS_DIR}")
 else
-    echo "Training data CSV already exists — skipping."
+    echo "Training data CSVs already exist — skipping generation."
 fi
 
 # ── Build job list ────────────────────────────────────────
@@ -62,10 +63,12 @@ HP_COUNT=$(cd "${PROJECT_DIR}" && julia --project="${PROJECT_DIR}" -e "
     print(length(HP_GRID))
 ")
 
-echo "Generating job list (${HP_COUNT} HP combinations × 1 config)..."
+echo "Generating job list (${HP_COUNT} HP combinations × 3 configs)..."
 > "${JOBLIST}"
-for hp in $(seq 1 "${HP_COUNT}"); do
-    echo "B_10x12 ${hp}"
+for cfg in A_5x24 B_10x12 C_20x6; do
+    for hp in $(seq 1 "${HP_COUNT}"); do
+        echo "${cfg} ${hp}"
+    done
 done >> "${JOBLIST}"
 
 TOTAL=$(wc -l < "${JOBLIST}")
@@ -89,7 +92,7 @@ PARALLEL_OPTS=(
 
 echo ""
 echo "═══════════════════════════════════════════════════"
-echo "  Launching HardwiredIC sweep — $(date)"
+echo "  Launching CompositeTransform sweep — $(date)"
 echo "═══════════════════════════════════════════════════"
 echo ""
 
@@ -101,14 +104,14 @@ echo ""
 # ── Parallel sweep ────────────────────────────────────────
 parallel "${PARALLEL_OPTS[@]}" \
     "cd ${PROJECT_DIR} && julia --project=${PROJECT_DIR} \
-          ${SCRIPT_DIR}/run_single_baccam_hardwired.jl {1} {2} ${SCRIPT_DIR}" \
+          ${SCRIPT_DIR}/run_single_baccam.jl {1} {2} ${SCRIPT_DIR}" \
     :::: "${JOBLIST}"
 
 echo ""
 echo "═══════════════════════════════════════════════════"
-echo "  HardwiredIC sweep complete — $(date)"
+echo "  CompositeTransform sweep complete — $(date)"
 echo ""
 echo "  Merge & analyse with:"
 echo "    cd ${PROJECT_DIR}"
-echo "    julia --project=. ${SCRIPT_DIR}/Baccam_hardwired_sweep_analysis.jl"
+echo "    julia --project=. ${SCRIPT_DIR}/Baccam_sweep_analysis.jl"
 echo "═══════════════════════════════════════════════════"

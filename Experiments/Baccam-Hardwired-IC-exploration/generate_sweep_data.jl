@@ -1,9 +1,9 @@
 #!/usr/bin/env julia
 #
-# generate_sweep_data.jl — Hardwired IC sweep
+# generate_sweep_data.jl — Composite transform sweep
 #
-# Produces the B_10x12 training CSV (10 timepoints × 12 mice).
-# Each row is a single mouse observation with log-normal noise.
+# Produces per-config CSVs (A_5x24, B_10x12, C_20x6) where each
+# row is a single mouse observation with log-normal noise.
 #
 # Usage:
 #   julia --project=. generate_sweep_data.jl [output_dir]
@@ -41,7 +41,6 @@ function generate_config(rng, sol_array, t_fine, n_tp, n_mice, noise_σ)
     t_obs  = Float32.(t_fine[idx])
     Y_true = Float32.(sol_array[:, idx])
 
-    # Log-normal multiplicative noise, mean-unbiased via -0.5σ² shift
     ε = randn(rng, Float32, 3, n_tp, n_mice)
     Y_noisy = clamp.(
         Y_true .* exp.(noise_σ .* ε .- 0.5f0 * noise_σ^2),
@@ -52,32 +51,38 @@ function generate_config(rng, sol_array, t_fine, n_tp, n_mice, noise_σ)
 end
 
 rng = MersenneTwister(42)
-cfg = generate_config(rng, sol_array, t_fine, 10, 12, 0.5f0)
+configs = Dict(
+    "A_5x24"  => generate_config(rng, sol_array, t_fine, 5,  24, 0.5f0),
+    "B_10x12" => generate_config(rng, sol_array, t_fine, 10, 12, 0.5f0),
+    "C_20x6"  => generate_config(rng, sol_array, t_fine, 20,  6, 0.5f0),
+)
 
 # ── Write to disk ─────────────────────────────────────────
 
 outdir = length(ARGS) >= 1 ? ARGS[1] : joinpath(pwd(), "Results")
 mkpath(outdir)
 
-rows = NamedTuple[]
-for m in 1:cfg.n_mice
-    for tp in 1:cfg.n_tp
-        push!(rows, (
-            t      = cfg.t_obs[tp],
-            T_obs  = cfg.Y_noisy[1, tp, m],
-            I_obs  = cfg.Y_noisy[2, tp, m],
-            V_obs  = cfg.Y_noisy[3, tp, m],
-            mouse  = m,
-            T_true = cfg.Y_true[1, tp],
-            I_true = cfg.Y_true[2, tp],
-            V_true = cfg.Y_true[3, tp],
-        ))
+for (label, cfg) in configs
+    rows = NamedTuple[]
+    for m in 1:cfg.n_mice
+        for tp in 1:cfg.n_tp
+            push!(rows, (
+                t      = cfg.t_obs[tp],
+                T_obs  = cfg.Y_noisy[1, tp, m],
+                I_obs  = cfg.Y_noisy[2, tp, m],
+                V_obs  = cfg.Y_noisy[3, tp, m],
+                mouse  = m,
+                T_true = cfg.Y_true[1, tp],
+                I_true = cfg.Y_true[2, tp],
+                V_true = cfg.Y_true[3, tp],
+            ))
+        end
     end
+    df = DataFrame(rows)
+    path = joinpath(outdir, "Baccam_$(label).csv")
+    CSV.write(path, df)
+    n_obs = cfg.n_tp * cfg.n_mice
+    println("Wrote $path  ($(cfg.n_tp) tp × $(cfg.n_mice) mice = $n_obs observations)")
 end
 
-df = DataFrame(rows)
-path = joinpath(outdir, "Baccam_B_10x12.csv")
-CSV.write(path, df)
-n_obs = cfg.n_tp * cfg.n_mice
-println("Wrote $path  ($(cfg.n_tp) tp × $(cfg.n_mice) mice = $n_obs observations)")
 println("\nData generation complete.")
