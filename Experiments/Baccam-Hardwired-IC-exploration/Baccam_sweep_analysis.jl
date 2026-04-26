@@ -23,7 +23,7 @@ using OrdinaryDiffEq
 # ══════════════════════════════════════════════════════════
 
 function parse_cli(args)
-    results_dir = joinpath(pwd(), "Experiments", "CompositeTransform-sweep", "Results")
+    results_dir = joinpath(pwd(), "Experiments", "Baccam-Hardwired-IC-exploration", "Results")
     master_override = nothing
     i = 1
     while i <= length(args)
@@ -140,8 +140,9 @@ for (old, new) in ["eps_ic"=>"ϵ_ic", "eps_ode"=>"ϵ_ode", "eps_Data"=>"ϵ_Data"
     old in names(df_all) && rename!(df_all, old => new)
 end
 
-df = filter(r -> r.converged && isfinite(r.data_mse) && isfinite(r.ode_mse), df_all)
-println("$(nrow(df)) converged / finite of $(nrow(df_all)) total.\n")
+df_finite = filter(r -> r.converged && isfinite(r.data_mse) && isfinite(r.ode_mse), df_all)
+df = filter(r -> r.data_mse < 1.0 && r.ode_mse < 1.0, df_finite)
+println("$(nrow(df)) runs with both losses < 1  ($(nrow(df_finite)) converged/finite, $(nrow(df_all)) total)\n")
 
 # ══════════════════════════════════════════════════════════
 # Pareto utilities
