@@ -20,17 +20,16 @@ This notebook tests two hypotheses:
    interaction with the log transform is the culprit.
 
 2. *Replacing the linear ramp t with a saturating ramp σ(t) fixes the
-   Baccam case.*  We compare three ramps:
+   Baccam case.*  We compare two ramps:
    - =LuxMLPHardwiredIC=: σ(t) = t  (existing)
    - =LuxMLPTanhIC=: σ(t) = tanh(a·t)
-   - =LuxMLPPowerIC=: σ(t) = (t/t_c)^α clamped to 1
 
 The comparison matrix is:
 
-| Model  | Transform | Soft IC | Hardwired (linear) | Tanh ramp | Power ramp |
-|--------+-----------+---------+--------------------+-----------+------------|
-| SIR    | ZScore    | ✓       | ✓                  | ✓         | ✓          |
-| Baccam | Log₁₀     | ✓       | ✓                  | ✓         | ✓          |
+| Model  | Transform | Soft IC | Hardwired (linear) | Tanh ramp |
+|--------+-----------+---------+--------------------+-----------|
+| SIR    | ZScore    | ✓       | ✓                  | ✓         |
+| Baccam | Log₁₀     | ✓       | ✓                  | ✓         |
 
 * Setup
 
@@ -56,6 +55,58 @@ using LinearAlgebra
 BLAS.set_num_threads(1)
 
 include(joinpath(pwd(), "Src", "Fitting.jl"))
+#+end_src
+
+#+RESULTS:
+
+** Loss-tracking callback
+
+A callback factory that accumulates loss history with a continuous
+iteration counter across Stage 1 and Stage 2.  Stage 2 iterations
+are offset by =maxiters_stage1= so the x-axis is monotonic.
+
+#+begin_src julia-vterm :results nil
+
+"""
+    make_loss_tracker(architecture, ode_param_ctor, maxiters_s1; log_every=100)
+
+Returns `(callback, history)`.  The callback is passed to `train()`;
+history is a NamedTuple of mutable vectors read after training.
+
+The global iteration counter offsets Stage 2 by `maxiters_s1` so that
+the loss curve is continuous across stages.
+"""
+function make_loss_tracker(architecture, ode_param_ctor, maxiters_s1;
+                           log_every::Int = 100)
+    hist = (
+        iter     = Int[],
+        data_mse = Float32[],
+        ode_mse  = Float32[],
+        stage    = Int[],       # 1 or 2
+    )
+
+    function cb(state, l)
+        state.iter % log_every != 0 && return false
+
+        ps  = state.u
+        ctx = state.p
+
+        is_s2 = ctx isa PINNCtxStage2
+        global_iter = is_s2 ? maxiters_s1 + state.iter : state.iter
+
+        d_mse = loss_Data(ps, ctx)
+        o_mse = is_s2 ? loss_ODE(ps, ctx, architecture, ode_param_ctor) : NaN32
+
+        push!(hist.iter,     global_iter)
+        push!(hist.data_mse, d_mse)
+        push!(hist.ode_mse,  o_mse)
+        push!(hist.stage,    is_s2 ? 2 : 1)
+
+        return false
+    end
+
+    return cb, hist
+end
 #+end_src
 
 #+RESULTS:
@@ -98,49 +149,6 @@ end
 
 # Reuse the same initialization as LuxMLP / LuxMLPHardwiredIC
 function initialize_components(::LuxMLPTanhIC, rng, data, build_state_mlp_fn, build_g_mlp_fn)
-    State_MLP = build_state_mlp_fn()
-    ps_StateMLP, st_StateMLP = Lux.setup(rng, State_MLP)
-    g_MLP = build_g_mlp_fn()
-    ps_gMLP, st_gMLP = Lux.setup(rng, g_MLP)
-    raw_ps = (StateMLP = ps_StateMLP, gMLP = ps_gMLP, ODE_par = data.ODE_par_init)
-    return State_MLP, st_StateMLP, g_MLP, st_gMLP, raw_ps
-end
-
-
-# ── Power-law ramp: σ(t) = min((t / t_c)^α, 1) ────────
-# α < 1 rises faster than linear near 0 → eliminates the 1/t singularity.
-# t_c sets the timescale at which σ saturates to 1.
-
-Base.@kwdef struct LuxMLPPowerIC <: AbstractArchitectureMode
-    fd_step::Float32 = 1f-03
-    α::Float32 = 0.5f0    # power-law exponent
-    t_c::Float32 = 1f0     # saturation timescale; set per-problem below
-end
-
-function make_state_predictor_power_ic(mlp, st, y0_transformed::AbstractVector,
-                                       α::Float32, t_c::Float32)
-    function predict(ps, t_grid::AbstractMatrix)
-        raw_nn = first(mlp(t_grid, ps.StateMLP, st))
-        ramp = min.((max.(t_grid, 0f0) ./ t_c) .^ α, 1f0)
-        # ramp = min.((t_grid ./ t_c) .^ α, 1f0)
-        return y0_transformed .+ ramp .* raw_nn
-    end
-    return predict
-end
-
-function build_predictors(mode::LuxMLPPowerIC,
-                          mlp, st, g_mlp, st_g,
-                          y0_transformed)
-    pred_state = make_state_predictor_power_ic(mlp, st, y0_transformed, mode.α, mode.t_c)
-    pred_deriv = make_deriv_predictor_fd(pred_state; h = mode.fd_step)
-    pred_g     = make_g_predictor(g_mlp, st_g)
-    return (predict_state = pred_state,
-            predict_deriv = pred_deriv,
-            predict_g     = pred_g,
-            skip_ic_loss  = true)
-end
-
-function initialize_components(::LuxMLPPowerIC, rng, data, build_state_mlp_fn, build_g_mlp_fn)
     State_MLP = build_state_mlp_fn()
     ps_StateMLP, st_StateMLP = Lux.setup(rng, State_MLP)
     g_MLP = build_g_mlp_fn()
@@ -214,7 +222,7 @@ println("Y range: $(extrema(sir_Y_mean))")
 #+RESULTS:
 : SIR training data: 15 timepoints × 8 mice
 : Y_mean shape: (3, 15)
-: Y range: (0.012565591f0, 3.0103898f0)
+: Y range: (0.01256559f0, 3.0103948f0)
 
 ** Architecture definitions
 
@@ -315,10 +323,6 @@ sir_mode_configs = Dict(
         arch_mode = LuxMLPTanhIC(a = 2f0 / sir_t_max),
         hp        = HyperParams(0f0, 0.1f0, 0.01f0, 0.5f0, 0.5f0),
     ),
-    "hardwired_power" => (
-        arch_mode = LuxMLPPowerIC(α = 0.5f0, t_c = sir_t_max / 2f0),
-        hp        = HyperParams(0f0, 0.1f0, 0.01f0, 0.5f0, 0.5f0),
-    ),
 )
 #+end_src
 
@@ -331,7 +335,12 @@ sir_mode_configs = Dict(
 using Base.Threads
 
 sir_tasks = Dict{String, Task}()
+sir_loss_histories = Dict{String, Any}()
+
 for (label, cfg) in sir_mode_configs
+    cb, hist = make_loss_tracker(SIRArchitectureRaw, SIRParams, sir_maxiters_s1)
+    sir_loss_histories[label] = hist
+
     sir_tasks[label] = Threads.@spawn begin
         println("[Thread $(Threads.threadid())] SIR — Starting $label")
 
@@ -350,6 +359,7 @@ for (label, cfg) in sir_mode_configs
             Opt_alg_stage2  = OptimizationOptimisers.Adam(sir_lr),
             build_state_mlp = sir_build_state_mlp,
             build_g_mlp     = sir_build_g_mlp,
+            callback_function = cb,
         )
 
         (res = res, time_s = stats.time, cfg = cfg)
@@ -366,8 +376,6 @@ for (label, t) in sir_tasks
             label, r.res.params.ODE_par.β, r.res.params.ODE_par.γ)
 end
 #+end_src
-
-#+RESULTS:
 
 * Baccam model
 
@@ -407,9 +415,9 @@ println("               V=[$(extrema(bac_sol_array[3,:]))]")
 
 #+RESULTS:
 : Baccam ODE solved: (3, 2001)
-: State ranges:  T=[(8176.1836f0, 4.0f8)]
-:                I=[(0.0f0, 1.5729f8)]
-:                V=[(0.073235795f0, 422674.88f0)]
+: State ranges:  T=[(8176.7227f0, 4.0f8)]
+:                I=[(0.0f0, 1.57291f8)]
+:                V=[(0.073236f0, 422655.06f0)]
 
 #+begin_src julia-vterm
 
@@ -486,9 +494,9 @@ bac_build_g_mlp() = Lux.Chain(
 
 log_tr = LogTransform(10f0, Float32[1f-2, 1f-2, 1f-2], Bool[true, true, true])
 
-Y_log  = forward_state(log_tr, bac_Y_mean)
-μ_log  = vec(mean(Y_log; dims=2))
-σ_log  = vec(max.(std(Y_log; dims=2), 1f-6))
+Y_log = forward_state(log_tr, bac_Y_mean)
+μ_log = vec(mean(Y_log; dims = 2))
+σ_log = vec(max.(std(Y_log; dims = 2), 1f-6))
 
 bac_transform = ComposedTransform(log_tr, ZScoreTransform(μ_log, σ_log))
 
@@ -548,10 +556,6 @@ bac_mode_configs = Dict(
         arch_mode = LuxMLPTanhIC(a = 2f0 / bac_t_max),
         hp        = bac_hp_hard,
     ),
-    "hardwired_power" => (
-        arch_mode = LuxMLPPowerIC(α = 0.5f0, t_c = bac_t_max / 2f0),
-        hp        = bac_hp_hard,
-    ),
 )
 #+end_src
 
@@ -562,7 +566,12 @@ bac_mode_configs = Dict(
 #+begin_src julia-vterm
 
 bac_tasks = Dict{String, Task}()
+bac_loss_histories = Dict{String, Any}()
+
 for (label, cfg) in bac_mode_configs
+    cb, hist = make_loss_tracker(BaccamArchitectureRaw, BaccamParams, bac_maxiters_s1)
+    bac_loss_histories[label] = hist
+
     bac_tasks[label] = Threads.@spawn begin
         println("[Thread $(Threads.threadid())] Baccam — Starting $label")
 
@@ -578,9 +587,10 @@ for (label, cfg) in bac_mode_configs
             maxiters_stage1 = bac_maxiters_s1,
             maxiters_stage2 = bac_maxiters_s2,
             Opt_alg_stage1  = OptimizationOptimisers.Adam(bac_lr),
-            Opt_alg_stage2  = OptimizationOptimisers.Adam(bac_lr),
+            Opt_alg_stage2  = OptimizationOptimisers.Adam(bac_lr/100),
             build_state_mlp = bac_build_state_mlp,
             build_g_mlp     = bac_build_g_mlp,
+            callback_function = cb,
         )
 
         (res = res, time_s = stats.time, cfg = cfg)
@@ -598,8 +608,6 @@ for (label, t) in bac_tasks
 end
 #+end_src
 
-#+RESULTS:
-
 * Diagnostics
 
 ** Summary tables
@@ -613,7 +621,7 @@ println("="^90)
         "Mode", "β (1.5)", "γ (1.0)", "Data MSE", "ODE MSE")
 println("-"^70)
 
-for label in ["soft_ic", "hardwired_linear", "hardwired_tanh", "hardwired_power"]
+for label in ["soft_ic", "hardwired_linear", "hardwired_tanh"]
     r = sir_results[label].res
     @printf("%-20s  β=%.3f   γ=%.3f   %.4e  %.4e\n",
             label, r.params.ODE_par.β, r.params.ODE_par.γ,
@@ -628,7 +636,7 @@ println("="^90)
         "Mode", "β (2.7e-5)", "δ (4.0)", "c (3.0)", "Data MSE", "ODE MSE")
 println("-"^90)
 
-for label in ["soft_ic", "hardwired_linear", "hardwired_tanh", "hardwired_power"]
+for label in ["soft_ic", "hardwired_linear", "hardwired_tanh"]
     r = bac_results[label].res
     @printf("%-20s  β=%.2e   δ=%.3f   c=%.3f   %.4e  %.4e\n",
             label, r.params.ODE_par.β, r.params.ODE_par.δ, r.params.ODE_par.c,
@@ -651,7 +659,7 @@ for (model_name, results, transform, u0) in [
     y0_trans = forward_state(transform, u0)
     println("\n── $model_name  (z₀ = $(round.(y0_trans; digits=3))) ──")
 
-    for label in ["soft_ic", "hardwired_linear", "hardwired_tanh", "hardwired_power"]
+    for label in ["soft_ic", "hardwired_linear", "hardwired_tanh"]
         r   = results[label]
         ps  = r.res.params
         ctx = r.res.ctx2
@@ -665,15 +673,15 @@ end
 
 * Visualisation
 
-** State trajectory fits
+** State rajectory fits
 
 Each row is a model (SIR / Baccam), each column an IC mode.
 Subplots show all state variables overlaid.
 
 #+begin_src julia-vterm
 
-mode_order  = ["soft_ic", "hardwired_linear", "hardwired_tanh", "hardwired_power"]
-mode_labels = ["Soft IC", "Hardwired (t)", "Tanh ramp", "Power ramp"]
+mode_order  = ["soft_ic", "hardwired_linear", "hardwired_tanh"]
+mode_labels = ["Soft IC", "Hardwired (t)", "Tanh ramp"]
 
 fig = Figure(size = (1200, 900), fontsize = 11)
 
@@ -740,7 +748,7 @@ for (col, (mode_key, mode_label)) in enumerate(zip(mode_order, mode_labels))
     end
 end
 
-Legend(fig[7, 1:4],
+Legend(fig[7, 1:3],
     [LineElement(color = :grey60, linewidth = 1.5, linestyle = :dash),
      LineElement(color = :royalblue, linewidth = 2),
      LineElement(color = :firebrick, linewidth = 2),
@@ -767,7 +775,6 @@ mode_colors = Dict(
     "soft_ic"           => :grey40,
     "hardwired_linear"  => :royalblue,
     "hardwired_tanh"    => :firebrick,
-    "hardwired_power"   => :forestgreen,
 )
 
 for (model_idx, (model_name, results, transform, u0, state_labels, t_max)) in enumerate([
@@ -871,6 +878,73 @@ Label(fig_g[0, 1:2],
 display(fig_g)
 #+end_src
 
+** Loss dynamics
+
+Data MSE and ODE MSE over the full training run.  The x-axis is a
+continuous global iteration count: Stage 1 runs from 0 to
+maxiters_s1, Stage 2 continues from maxiters_s1 onward.  A vertical
+dashed line marks the Stage 1 → Stage 2 transition.
+
+#+begin_src julia-vterm
+
+fig_loss = Figure(size = (1200, 500), fontsize = 11)
+
+for (col, (model_name, loss_hists, maxiters_s1_val)) in enumerate([
+    ("SIR",    sir_loss_histories, sir_maxiters_s1),
+    ("Baccam", bac_loss_histories, bac_maxiters_s1),
+])
+    # Data MSE
+    ax_d = Makie.Axis(fig_loss[1, col];
+        title  = "$model_name — Data MSE",
+        xlabel = "",
+        ylabel = col == 1 ? "Data MSE" : "",
+        yscale = Makie.log10,
+        xgridvisible = true, ygridvisible = true,
+        topspinevisible = false, rightspinevisible = false,
+        xticklabelsize = 8, yticklabelsize = 8)
+
+    vlines!(ax_d, [maxiters_s1_val]; color = :grey50, linestyle = :dash, linewidth = 1)
+
+    for label in mode_order
+        hist = loss_hists[label]
+        isempty(hist.iter) && continue
+        lines!(ax_d, hist.iter, hist.data_mse;
+            color = mode_colors[label], linewidth = 1.2, label = label)
+    end
+
+    col == 1 && axislegend(ax_d; position = :rt, labelsize = 7)
+
+    # ODE MSE
+    ax_o = Makie.Axis(fig_loss[2, col];
+        title  = "$model_name — ODE MSE",
+        xlabel = "Iteration (global)",
+        ylabel = col == 1 ? "ODE MSE" : "",
+        yscale = Makie.log10,
+        xgridvisible = true, ygridvisible = true,
+        topspinevisible = false, rightspinevisible = false,
+        xticklabelsize = 8, yticklabelsize = 8)
+
+    vlines!(ax_o, [maxiters_s1_val]; color = :grey50, linestyle = :dash, linewidth = 1)
+
+    for label in mode_order
+        hist = loss_hists[label]
+        isempty(hist.iter) && continue
+        omask = .!isnan.(hist.ode_mse)
+        any(omask) || continue
+        lines!(ax_o, hist.iter[omask], hist.ode_mse[omask];
+            color = mode_colors[label], linewidth = 1.2)
+    end
+
+    Makie.linkxaxes!(ax_d, ax_o)
+end
+
+Label(fig_loss[0, 1:2],
+    "Training loss dynamics — Stage 1 | Stage 2 (dashed line = transition)";
+    fontsize = 13, tellwidth = false)
+
+display(fig_loss)
+#+end_src
+
 #+RESULTS:
 
 * Summary
@@ -901,5 +975,4 @@ println("\n\nExpected pattern:")
 println("  • SIR: all modes similar (ZScore transform, states ~O(1))")
 println("  • Baccam hardwired_linear: worst (1/t singularity under log transform)")
 println("  • Baccam hardwired_tanh: improved (saturating ramp avoids worst of singularity)")
-println("  • Baccam hardwired_power: potentially best hardwired (sublinear ramp near t=0)")
-#+end_src#+title:
+#+end_src
