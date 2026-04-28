@@ -20,27 +20,6 @@ Utilities
 
 using Optimization, OptimizationOptimisers, OptimizationOptimJL
 
-"""
-Dispatch marker for ODE-parameter optimisation policy.
-"""
-abstract type AbstractODEParamPolicy end
-
-"""
-Default policy: optimise every ODE parameter (existing behaviour).
-"""
-struct TrainAllODE <: AbstractODEParamPolicy end
-
-"""
-Selective policy:
-`spec` is a NamedTuple where each key is an ODE parameter name and each value is
-either `:train` or a fixed numeric value.
-"""
-struct SelectiveODE{S<:NamedTuple} <: AbstractODEParamPolicy
-    spec::S
-end
-
-include("Utils.jl")
-
 
 """
 A hyperparam container struct containing ... hyperparams.
@@ -93,7 +72,7 @@ Stage 2 context: ODE-regularised training.
 Adds the g-predictor, dense collocation grid, ODE-specific
 epsilon, and parameter bounds on top of Stage 1 fields.
 """
-struct PINNCtxStage2{PS,PD,PG,T,Y,YS,GS,V,TR,TD,OP,OI}
+struct PINNCtxStage2{PS,PD,PG,T,Y,YS,GS,V,TR,TD}
     predict_state  :: PS
     predict_deriv  :: PD
     predict_g      :: PG
@@ -112,8 +91,6 @@ struct PINNCtxStage2{PS,PD,PG,T,Y,YS,GS,V,TR,TD,OP,OI}
     t_dense        :: TD
     t_span         :: Vector{Float32}
     ODE_par_bounds :: NamedTuple
-    ode_param_policy :: OP
-    ode_par_init     :: OI
 end
 
 """
@@ -258,7 +235,6 @@ function build_contexts(
     data, hp::HyperParams;
     transform::AbstractStateTransform = IdentityTransform(),
     arch_mode::AbstractArchitectureMode = LuxMLP(),
-    ode_param_policy::AbstractODEParamPolicy = TrainAllODE(),
 )
     # Transform raw training data into network coordinates
     Y_train_raw = raw_training_targets(data)
@@ -311,8 +287,6 @@ function build_contexts(
         data.t_dense,
         data.t_span,
         data.ODE_par_bounds,
-        ode_param_policy,
-        data.ODE_par_init,
     )
 
     return ctx_stage1, ctx_stage2
@@ -344,8 +318,6 @@ function rebuild_ctx_stage2(ctx::PINNCtxStage2, frozen_scale::AbstractMatrix)
         ctx.t_dense,
         ctx.t_span,
         ctx.ODE_par_bounds,
-        ctx.ode_param_policy,
-        ctx.ode_par_init,
     )
 end
 
@@ -455,7 +427,6 @@ function train(
     hp::HyperParams = HyperParams(1f0, 1f0, 1f0, 1f0, 1f0);
     transform::AbstractStateTransform = IdentityTransform(),
     arch_mode::AbstractArchitectureMode = LuxMLP(),
-    ode_param_policy::AbstractODEParamPolicy = TrainAllODE(),
     user_loss_functions::AbstractVector{<:Function} = Function[],
     seed::Integer = 1,
     maxiters_stage1::Integer = 10_000,
@@ -474,17 +445,13 @@ function train(
     State_MLP, st_StateMLP, g_MLP, st_gMLP, raw_ps =
         initialize_components(arch_mode, rng, data, build_state_mlp, build_g_mlp)
 
-    _validate_ode_policy(raw_ps.ODE_par, ode_param_policy)
-    ode_trainables = initial_ode_trainables(raw_ps.ODE_par, ode_param_policy)
-
     # 2. Append hyper entries if adaptive, then wrap in ComponentArray
-    initial_params = build_trainables(mode, raw_ps.StateMLP, raw_ps.gMLP, ode_trainables, hp)
+    initial_params = build_trainables(mode, raw_ps.StateMLP, raw_ps.gMLP, raw_ps.ODE_par, hp)
 
     # 3. Build training contexts (applies transform, creates predictor closures)
     ctx_stage1, ctx_stage2 = build_contexts(
         State_MLP, st_StateMLP, g_MLP, st_gMLP, data, hp;
         transform = transform, arch_mode = arch_mode,
-        ode_param_policy = ode_param_policy,
     )
 
     # 3. Stage 1: supervised data fitting

@@ -122,8 +122,7 @@ network's coordinate space
 """
 function loss_ODE(ps, ctx, architecture::Function, ode_param_constructor)
     t_dense = ctx.t_dense
-    ode_par = resolve_ode_params(ps.ODE_par, ctx.ode_param_policy, ctx.ode_par_init)
-    ode_par = ode_param_constructor(ode_par)
+    ode_par = ode_param_constructor(ps.ODE_par)
 
     # All three predictions via contract closures
     ẑ     = ctx.predict_state(ps, t_dense)
@@ -169,7 +168,7 @@ Soft constraint that penalises ODE parameters straying outside
 their declared bounds.  Uses a one-sided quadratic barrier.
 """
 function param_bound_penalty(ps, ctx)
-    p = resolve_ode_params(ps.ODE_par, ctx.ode_param_policy, ctx.ode_par_init)
+    p = ps.ODE_par
     b = ctx.ODE_par_bounds
     keys = propertynames(b)
 
