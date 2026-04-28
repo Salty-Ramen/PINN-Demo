@@ -1,0 +1,470 @@
+#+TITLE: Baccam — Comparing IC × Derivative Mode Combinations
+#+AUTHOR: Ramakrishna Suresh
+#+PROPERTY: header-args:julia-vterm :session *julia* :results output :exports both :dir (projectile-project-root) :tangle yes :comments both
+#+STARTUP: inlineimages overview
+
+* Goals
+
+Compare all four combinations of `LuxMLP{IC, D}`:
+
+| IC axis      | Derivative axis  |
+|--------------+------------------|
+| SoftIC       | HandFD           |
+| SoftIC       | ForwardDiffAD    |
+| HardwiredIC  | HandFD           |
+| HardwiredIC  | ForwardDiffAD    |
+
+Three things are checked:
+
+1. *Sanity at fixed parameters* — do both derivative methods agree on
+   `dŷ/dt` for the same trained network, before any retraining?
+2. *Training stability* — does each combination train without AD errors,
+   and how does loss evolve?
+3. *Final fit quality* — are the recovered ODE parameters and state
+   trajectories comparable across methods?
+
+Run on Baccam config B (10 timepoints × 12 mice).  Iteration counts are
+reduced from the production sweep to keep the comparison tractable;
+absolute MSE values will be higher than a fully-converged run, but the
+*relative* ordering across methods is what matters.
+
+* Setup
+** Activate environment
+
+#+begin_src julia-vterm :results nil
+using Pkg;
+Pkg.activate(".")
+#+end_src
+
+#+RESULTS:
+
+** Imports
+
+#+begin_src julia-vterm :results nil
+using ComponentArrays
+using Lux, NNlib
+using Optimization, OptimizationOptimisers
+using Statistics, Random
+using OrdinaryDiffEq
+using CairoMakie, Makie
+using Printf
+using Base.Threads
+using LinearAlgebra
+BLAS.set_num_threads(1)
+
+include(joinpath(pwd(), "Src", "Fitting.jl"))
+#+end_src
+
+#+RESULTS:
+
+* Data generation
+
+Same Baccam ODE and noisy-mouse data as the IC-compare notebook.
+
+#+begin_src julia-vterm
+
+function Baccam_model!(du, u, p, t)
+    T, I, V = u
+    du[1] = -p.β * T * V
+    du[2] =  p.β * T * V - p.δ * I
+    du[3] =  p.p * I     - p.c * V
+end
+
+true_params = (β = 2.7f-5, δ = 4.0f0, p = 1.2f-2, c = 3.0f0)
+u0 = Float32[4.0f8, 0.0f0, 9.3f-2]
+t_span = (0.0f0, 8.0f0)
+N_fine = 2001
+t_fine = collect(range(t_span[1], t_span[2], length = N_fine))
+
+prob = ODEProblem(Baccam_model!, u0, t_span, true_params)
+sol  = solve(prob, Tsit5(); saveat = t_fine)
+sol_array = Array(sol)
+
+rng = MersenneTwister(42)
+noise_σ = 0.5f0
+n_tp, n_mice = 10, 12
+
+idx = round.(Int, range(1, length(t_fine), length = n_tp))
+t_obs  = Float32.(t_fine[idx])
+Y_true = Float32.(sol_array[:, idx])
+
+ε = randn(rng, Float32, 3, n_tp, n_mice)
+Y_noisy = Y_true .* exp.(noise_σ .* ε .- 0.5f0 * noise_σ^2)
+Y_noisy = clamp.(Y_noisy, 0.0f0, Inf32)
+Y_mean = dropdims(mean(Y_noisy; dims = 3); dims = 3)
+
+println("Training data ready: $(n_tp) timepoints × $(n_mice) mice")
+#+end_src
+
+#+RESULTS:
+
+* Architecture pieces (shared across all 6 modes)
+
+#+begin_src julia-vterm
+
+struct BaccamParams{T<:AbstractFloat}
+    β::T; δ::T; c::T
+end
+BaccamParams(nt::ComponentVector) = BaccamParams(nt.β, nt.δ, nt.c)
+
+function BaccamArchitectureRaw(y, g, p::BaccamParams)
+    T, I, V = y[1,:], y[2,:], y[3,:]
+    g_T, g_V = g[1,:], g[2,:]
+    dT = g_T
+    dI = p.β .* T .* V .- p.δ .* I
+    dV = g_V .- p.c .* V
+    return permutedims(hcat(dT, dI, dV))
+end
+
+build_state_mlp() = Lux.Chain(
+    Lux.Dense(1, 8, tanh_fast),
+    Lux.Dense(8, 6, tanh_fast),
+    Lux.Dense(6, 3),
+)
+
+build_g_mlp() = Lux.Chain(
+    Lux.Dense(1, 6, tanh_fast),
+    Lux.Dense(6, 4, tanh_fast),
+    Lux.Dense(4, 2),
+)
+
+state_transform = LogTransform(
+    10f0,
+    Float32[1f-6, 1f-6, 1f-6],
+    Bool[true, true, true],
+)
+
+t_train = permutedims(t_obs)
+t_dense = permutedims(Float32.(range(minimum(t_obs), maximum(t_obs); length = 1000)))
+t_span_vec = Float32[minimum(t_obs), maximum(t_obs)]
+
+data = (
+    t_train        = t_train,
+    Y_train        = Y_mean,
+    Y_train_std    = ones(Float32, 3, 1),
+    t_dense        = t_dense,
+    t_span         = t_span_vec,
+    y0_init        = u0,
+    ODE_par_init   = (β = 1.0f-4, δ = 1.0f0, c = 1.0f0),
+    ODE_par_bounds = (β = Float32[0, 1f-2], δ = Float32[0, 20], c = Float32[0, 20]),
+)
+#+end_src
+
+#+RESULTS:
+
+* Sanity note
+
+The training comparison below is itself the sanity check: if any
+derivative method has wiring problems, it will surface immediately as
+
+- A warning at Stage 2 start (e.g. "ForwardDiff within Zygote cannot
+  track gradients" — indicates StatefulLuxLayer wiring isn't engaging
+  Lux's nested-AD rule).
+- NaN gradients during training.
+- Vastly degraded final ode_mse compared to the FD baseline.
+
+A separate "do the methods agree on dŷ/dt at fixed parameters" check
+adds complexity (recovering trained Lux states for cross-method evaluation)
+without much information beyond what the training run itself reveals.
+
+* Training comparison — all 4 combinations
+
+** Callback
+
+Prints iteration count every 10 iters, with the stage tagged and the
+wall-clock seconds-per-iteration over the last 10-iter window.  Stage
+detection uses `ctx isa PINNCtxStage2` — same pattern used in the sweep
+worker callback.  Output will be heavy (~7000 lines for 5k+10k iters)
+but useful for confirming the AD path isn't silently stalling and for
+spotting per-iteration cost differences between FD and AD live.
+
+#+begin_src julia-vterm :results nil
+
+# Closure over a Ref so we can mutate the previous-timestamp without
+# making `callback_iter10` itself stateful at the global level.  Reset
+# this between training runs so the first window of each new run isn't
+# inflated by Julia's compilation latency carried over from the prior run.
+let
+    last_t = Ref(time())
+
+    global function callback_iter10(state, l)
+        state.iter % 10 == 0 || return false
+        now = time()
+        s_per_iter = (now - last_t[]) / 10
+        last_t[] = now
+        stage = state.p isa PINNCtxStage2 ? "S2" : "S1"
+        @printf("[%s] iter = %6d  loss = %.4e  %.3f s/iter\n",
+                stage, state.iter, l, s_per_iter)
+        return false
+    end
+
+    global reset_callback_iter10!() = (last_t[] = time(); nothing)
+end
+#+end_src
+
+#+RESULTS:
+
+The first window of each training run will be inflated by JIT compilation.
+Call `reset_callback_iter10!()` at the start of each run to reset the
+clock so the inflated window is the *first* window of that run, not the
+gap since the previous run finished.
+** Diagnosis
+#+begin_src julia-vterm
+
+using Lux, Zygote, ForwardDiff, ADTypes, BenchmarkTools
+mlp = build_state_mlp()
+ps_test, st_test = Lux.setup(MersenneTwister(1), mlp)
+t_test = permutedims(Float32.(range(0, 8, length=1000)))   # match your dense grid
+
+println("--- 1. Plain MLP forward pass (1000 cols) ---")
+smlp = Lux.StatefulLuxLayer{true}(mlp, ps_test, st_test)
+@btime $smlp($t_test)
+
+println("--- 2. batched_jacobian forward only (no Zygote) ---")
+@btime Lux.batched_jacobian($smlp, AutoForwardDiff(), $t_test)
+
+println("--- 3. Zygote.gradient over a sum of forward MLP ---")
+@btime Zygote.gradient(p -> begin
+    s = Lux.StatefulLuxLayer{true}($mlp, p, $st_test)
+    sum(s($t_test))
+end, $ps_test)
+
+println("--- 4. Zygote.gradient over sum of batched_jacobian (the actual hot path) ---")
+@btime Zygote.gradient(p -> begin
+    s = Lux.StatefulLuxLayer{true}($mlp, p, $st_test)
+    sum(Lux.batched_jacobian(s, AutoForwardDiff(), $t_test))
+end, $ps_test)
+
+#+end_src
+
+#+RESULTS:
+
+** Run
+
+Now train each combination from scratch and record metrics.
+
+#+begin_src julia-vterm
+
+hp_train = HyperParams(0.0f0, 0.1f0, 4f-4, 0.5f0, 0.5f0)
+
+# Per-combination iteration budget.  Reduced from production for tractability.
+# 5k / 10k gives a fast first look — relative ordering of methods is what
+# matters here, not absolute fit quality.  Bump these up once the comparison
+# is trusted.
+maxiters_s1 = 5_000
+maxiters_s2 = 500
+
+# All 4 combinations
+combos = [
+    ("SoftIC + HandFD",        LuxMLP(SoftIC(),      HandFD())),
+    ("SoftIC + ForwardDiffAD", LuxMLP(SoftIC(),      ForwardDiffAD())),
+    ("HardIC + HandFD",        LuxMLP(HardwiredIC(), HandFD())),
+    ("HardIC + ForwardDiffAD", LuxMLP(HardwiredIC(), ForwardDiffAD())),
+]
+
+results = Dict{String, Any}()
+
+# Run sequentially so AD errors (if any) don't get masked by thread fan-out
+for (label, mode) in combos
+    println("\n──────────────────────────────────────────────────────")
+    println("  Training: $label")
+    println("──────────────────────────────────────────────────────")
+
+    stats = @timed begin
+        try
+            reset_callback_iter10!()
+            train(
+                FixedHyper(), data,
+                BaccamArchitectureRaw, BaccamParams, hp_train;
+                transform         = state_transform,
+                arch_mode         = mode,
+                seed              = 1,
+                maxiters_stage1   = maxiters_s1,
+                maxiters_stage2   = maxiters_s2,
+                Opt_alg_stage1    = OptimizationOptimisers.Adam(1f-4),
+                Opt_alg_stage2    = OptimizationOptimisers.Adam(1f-4),
+                build_state_mlp   = build_state_mlp,
+                build_g_mlp       = build_g_mlp,
+                callback_function = callback_iter10,
+            )
+        catch e
+            @warn "FAILED: $label" exception = (e, catch_backtrace())
+            nothing
+        end
+    end
+
+    results[label] = (res = stats.value, time_s = stats.time, mode = mode)
+
+    if isnothing(stats.value)
+        @printf("  [%s] FAILED in %.1fs\n", label, stats.time)
+    else
+        r = stats.value
+        @printf("  [%s] wall=%.1fs  data_mse=%.3e  ode_mse=%.3e  β=%.2e  δ=%.3f  c=%.3f\n",
+                label, stats.time,
+                r.metrics.data_mse, r.metrics.ode_mse,
+                r.params.ODE_par.β, r.params.ODE_par.δ, r.params.ODE_par.c)
+    end
+end
+#+end_src
+
+#+RESULTS:
+
+* Summary table
+
+#+begin_src julia-vterm
+
+println("\n", "="^95)
+println("  Summary — all 4 combinations")
+println("="^95)
+@printf("  %-25s %-8s %-12s %-12s %-10s %-8s %-8s\n",
+        "Combination", "wall(s)", "data_mse", "ode_mse", "β (2.7e-5)", "δ (4.0)", "c (3.0)")
+println("  ", "-"^91)
+
+for (label, _) in combos
+    r = results[label]
+    if isnothing(r.res)
+        @printf("  %-25s %-8.1f %-12s %-12s %-10s %-8s %-8s\n",
+                label, r.time_s, "FAILED", "FAILED", "—", "—", "—")
+    else
+        res = r.res
+        @printf("  %-25s %-8.1f %-12.3e %-12.3e %-10.2e %-8.3f %-8.3f\n",
+                label, r.time_s,
+                res.metrics.data_mse, res.metrics.ode_mse,
+                res.params.ODE_par.β, res.params.ODE_par.δ, res.params.ODE_par.c)
+    end
+end
+#+end_src
+
+#+RESULTS:
+
+* Trajectory comparison plots
+
+For visual comparison, plot the 3 state trajectories per combination
+on a 6 × 3 grid (rows = combinations, columns = states).  True ODE
+in dashed grey, NN fit in solid colour, mouse data as boxplots.
+
+#+begin_src julia-vterm
+
+successful = filter(combos) do (label, _)
+    !isnothing(results[label].res)
+end
+
+n_success = length(successful)
+fig_traj = Figure(size = (1200, 200 * n_success + 60), fontsize = 11)
+
+t_eval_traj = permutedims(Float32.(range(t_span_vec[1], t_span_vec[2]; length = 300)))
+plot_floor = 1f-2
+unique_t = sort(unique(t_obs))
+box_width = length(unique_t) > 1 ? 0.6f0 * minimum(diff(unique_t)) : 0.3f0
+
+state_titles = ["T(t)", "I(t)", "V(t)"]
+
+for (row, (label, _)) in enumerate(successful)
+    r = results[label].res
+    ŷ_trans = r.ctx2.predict_state(r.params, t_eval_traj)
+    ŷ_raw = inverse_state(state_transform, ŷ_trans)
+
+    for col in 1:3
+        ax = Makie.Axis(fig_traj[row, col];
+            title  = row == 1 ? state_titles[col] : "",
+            xlabel = row == n_success ? "Days p.i." : "",
+            ylabel = col == 1 ? label : "",
+            yscale = Makie.log10,
+            xgridvisible = true, ygridvisible = true,
+            topspinevisible = false, rightspinevisible = false,
+            yticklabelsize = 8, xticklabelsize = 8,
+            titlesize = 11,
+        )
+
+        # True ODE
+        lines!(ax, t_fine, sol_array[col, :] .+ plot_floor;
+            color = :grey60, linewidth = 1.5, linestyle = :dash)
+        # NN fit
+        lines!(ax, vec(t_eval_traj), ŷ_raw[col, :] .+ plot_floor;
+            color = :royalblue, linewidth = 2)
+        # Mouse data
+        t_box = repeat(t_obs, n_mice)
+        y_box = vec(Y_noisy[col, :, :] .+ plot_floor)
+        boxplot!(ax, t_box, y_box;
+            width = box_width,
+            color = (:grey80, 0.4),
+            whiskerwidth = 0.4, strokewidth = 0.6,
+            mediancolor = :black, medianlinewidth = 1.2,
+            outliercolor = (:black, 0.3), markersize = 2,
+        )
+    end
+end
+
+Label(fig_traj[0, 1:3], "State trajectory fits per combination";
+    fontsize = 14, tellwidth = false)
+
+display(fig_traj)
+#+end_src
+
+#+RESULTS:
+
+* Wall-time and recovered parameter visualisation
+
+#+begin_src julia-vterm
+
+labels_ok = [label for (label, _) in successful]
+walls    = [results[l].time_s for l in labels_ok]
+betas    = [results[l].res.params.ODE_par.β for l in labels_ok]
+deltas   = [results[l].res.params.ODE_par.δ for l in labels_ok]
+cs       = [results[l].res.params.ODE_par.c for l in labels_ok]
+
+fig_bars = Figure(size = (1100, 700), fontsize = 11)
+
+# Row 1: wall time
+ax1 = Makie.Axis(fig_bars[1, 1:3];
+    title = "Wall time (s) — lower is better",
+    xticks = (1:length(labels_ok), labels_ok),
+    xticklabelrotation = π/6, xticklabelsize = 9,
+    topspinevisible = false, rightspinevisible = false,
+)
+barplot!(ax1, 1:length(labels_ok), walls; color = :slategray)
+
+# Row 2: parameter recovery
+param_truths = (β = 2.7f-5, δ = 4.0f0, c = 3.0f0)
+param_vals   = (betas, deltas, cs)
+param_names  = ("β", "δ", "c")
+
+for (col, (name, vals)) in enumerate(zip(param_names, param_vals))
+    truth = getproperty(param_truths, Symbol(name))
+    ax = Makie.Axis(fig_bars[2, col];
+        title = "$name (true = $truth)",
+        xticks = (1:length(labels_ok), labels_ok),
+        xticklabelrotation = π/6, xticklabelsize = 8,
+        topspinevisible = false, rightspinevisible = false,
+    )
+    barplot!(ax, 1:length(labels_ok), vals; color = :steelblue)
+    hlines!(ax, [truth]; color = :firebrick, linewidth = 2, linestyle = :dash)
+end
+
+display(fig_bars)
+#+end_src
+
+#+RESULTS:
+
+* Notes on interpretation
+
+When reading these results, what to look for:
+
+1. *In the training comparison* — wall time per iteration should rank
+   roughly: HandFD < ForwardDiffAD (per-step cost).  If AD wall time is
+   a *lot* worse than FD (10×+), the StatefulLuxLayer wiring isn't
+   engaging Lux's nested-AD rule — check Stage 2 logs for the "ForwardDiff
+   within Zygote cannot track gradients" warning.  Final fit quality
+   should be comparable across methods on the same IC.
+
+2. *Soft IC vs Hardwired IC* — independently of derivative method,
+   hardwired IC should give exact y(0) = y₀ and may converge faster in
+   the early iterations; the IC penalty is one less competing gradient
+   signal.  Final fit quality often comparable; the soft form has more
+   flexibility but pays the IC-loss tax.
+
+3. *NaN gradients* — if any combination NaNs out and recovers (the
+   optimizer skips updates), the run completes but with degraded metrics.
+   This was observed historically for HardIC + HandFD around iteration
+   9000 and may resurface; if so, smaller learning rate or larger FD step
+   are the typical fixes.

@@ -44,9 +44,14 @@ end
 
 # ──────────────────────────────────────────────────────────
 # Identity: leaves the state untouched in both directions.
+# Both matrix and vector overloads are defined explicitly to
+# avoid ambiguity with the AbstractVector convenience overload
+# at the bottom of the file.
 # ──────────────────────────────────────────────────────────
-forward_state(::IdentityTransform, Y) = Y
-inverse_state(::IdentityTransform, Z) = Z
+forward_state(::IdentityTransform, Y::AbstractMatrix) = Y
+inverse_state(::IdentityTransform, Z::AbstractMatrix) = Z
+forward_state(::IdentityTransform, y::AbstractVector) = y
+inverse_state(::IdentityTransform, z::AbstractVector) = z
 
 # ──────────────────────────────────────────────────────────
 # LogTransform: forward / inverse
