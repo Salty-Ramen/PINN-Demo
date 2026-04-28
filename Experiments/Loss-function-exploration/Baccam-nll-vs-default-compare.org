@@ -1,0 +1,1072 @@
+#+TITLE: Baccam — Default Loss vs Log-Likelihood Loss
+#+AUTHOR: Ramakrishna Suresh
+#+PROPERTY: header-args:julia-vterm :session *julia* :results output :exports both :dir (projectile-project-root) :tangle yes :comments both
+#+STARTUP: inlineimages overview
+
+* Background
+
+This notebook tests the hypothesis that replacing the default MSE-with-data-std
+data loss with a *proper Gaussian log-likelihood in transformed space*
+improves convergence for the Baccam model.
+
+** Data-generating process
+
+The synthetic dataset uses multiplicative log-normal noise:
+
+  y_obs = y_true · exp(σ·ε - σ²/2),    ε ~ N(0,1),  σ = 0.5
+
+Taking logs:
+
+  log y_obs = log y_true + σ·ε - σ²/2
+
+so log y_obs is exactly Gaussian with constant variance σ². The noise is
+*homoscedastic in log-space* by construction. There is no per-timepoint
+or per-state variance structure to discover — it is the same σ everywhere.
+
+** Why log-likelihood, not MSE-with-data-std
+
+The default =loss_Data= divides residuals by =Y_train_std= (per-state std
+of the training trajectory). This is the *signal* scale, not the *noise*
+scale. The result is an MSE-shaped objective with a denominator chosen
+for numerical convenience, not statistical correctness.
+
+The Gaussian NLL in transformed coordinates is:
+
+  -log p ∝ (1/2σ²) Σ (z_obs - ẑ)²
+
+where z = log_b(y + s) is the transformed coordinate the network operates
+in, σ is the *known noise std in z-space* (= 0.5), and the sum runs over
+all observations (states × timepoints × mice). No ε_Data is needed — σ²
+already plays that role and is determined by the noise model rather than
+being a free hyperparameter.
+
+** Per-timepoint vs global σ — homoscedasticity decision
+
+The data is homoscedastic in log-space by construction, so a single global
+σ is the correct model. Per-timepoint σ_k would add 10 free parameters per
+state for no signal gain, and individual estimates have standard error
+σ/√(2(n-1)) ≈ 0.11 with 12 mice — bouncing between 0.4 and 0.6 even when
+the true σ is exactly 0.5. We use a single σ = 0.5 fixed.
+
+For real data with possible heteroscedasticity, a per-state learned σ_i
+(with =log σ_i= as a trainable parameter and the corresponding =N·log σ=
+term in the likelihood) is the natural extension. We toggle this off here
+because we know the truth.
+
+** Using the full noisy dataset, not the means
+
+The previous version collapsed 12 mice per timepoint into a single mean
+trajectory. Under log-normal noise this is biased (Jensen's inequality:
+log of the mean ≠ mean of the logs) and discards information (120 noisy
+observations vs 10 means). The NLL rows train on all 120 observations
+flattened; the default rows still train on means for backward comparison.
+
+** Comparison matrix
+
+|                                  | Soft IC | Hardwired IC |
+|----------------------------------+---------+--------------|
+| Default MSE + Log transform      |    A    |      B       |
+| Gaussian NLL + Log transform     |    C    |      D       |
+
+The transform is now identical across both rows: =LogTransform= maps the
+multi-magnitude raw states into log10-coordinates where a plain linear-output
+MLP works fine. The only difference between rows is the loss function and
+the dataset shape (means vs full mouse data). This isolates the loss-function
+effect cleanly.
+
+* Setup
+
+** Boilerplate
+
+#+begin_src julia-vterm :results nil
+using Pkg;
+Pkg.activate(".")
+#+end_src
+
+#+RESULTS:
+
+#+begin_src julia-vterm :results nil
+using ComponentArrays
+using Lux, NNlib
+using Optimization, OptimizationOptimisers
+using Statistics
+using Random
+using OrdinaryDiffEq
+using CairoMakie, Makie
+using Printf
+using LinearAlgebra
+using Logging
+BLAS.set_num_threads(1)
+
+include(joinpath(pwd(), "Src", "Fitting.jl"))
+#+end_src
+
+#+RESULTS:
+
+** Loss-tracking callback
+
+Same as the IC-ramp comparison — accumulates loss history with a continuous
+iteration counter across Stage 1 and Stage 2 so the loss curves are plotted
+on a single x-axis.
+
+#+begin_src julia-vterm :results nil
+
+function make_loss_tracker(architecture, ode_param_ctor, maxiters_s1;
+                           log_every::Int = 100,
+                           data_loss_fn = loss_Data)
+    hist = (
+        iter     = Int[],
+        data_mse = Float32[],
+        ode_mse  = Float32[],
+        stage    = Int[],
+    )
+
+    function cb(state, l)
+        state.iter % log_every != 0 && return false
+
+        ps  = state.u
+        ctx = state.p
+
+        is_s2 = ctx isa PINNCtxStage2
+        global_iter = is_s2 ? maxiters_s1 + state.iter : state.iter
+
+        # data_loss_fn is whatever loss is being tracked — MSE or NLL
+        d_mse = data_loss_fn(ps, ctx)
+        o_mse = is_s2 ? loss_ODE(ps, ctx, architecture, ode_param_ctor) : NaN32
+
+        push!(hist.iter,     global_iter)
+        push!(hist.data_mse, d_mse)
+        push!(hist.ode_mse,  o_mse)
+        push!(hist.stage,    is_s2 ? 2 : 1)
+
+        return false
+    end
+
+    return cb, hist
+end
+#+end_src
+
+#+RESULTS:
+
+** NaN/Inf diagnostic callback
+
+Wraps an inner callback (e.g. =make_loss_tracker= or =callback_iter1000=)
+with a one-shot diagnostic that fires the first time the loss or any
+component goes non-finite. Probes the four mathematical danger zones
+identified for the (loss, IC) configurations:
+
+  - =extrema(ẑ)= on the dense grid: catches A.1 overflow (ẑ > 37) and
+    A.2 underflow (ẑ < -37) which would make =b^ẑ= overflow or the
+    chain-rule denominator =(y+s)·ln b= underflow to zero.
+  - =extrema(NN_output)= on the dense grid: for hardwired IC, separates
+    "the network is fine but t·NN amplifies it" (B.2) from "the network
+    itself is producing extreme values."
+  - =extrema(g_output)= on the dense grid: catches a runaway g-network
+    driving the ODE residual.
+  - Each loss component evaluated independently: tells you whether
+    data, IC, or ODE is the source. A finite forward loss with NaN
+    gradient indicates the indeterminate-form-in-chain-rule case.
+
+The first non-finite event is printed under a thread lock so per-mode
+prefixes don't interleave. Subsequent events from the same mode are
+suppressed (one-shot) — once you know which probe fired first, that
+identifies the case and further reports add noise.
+
+Set =threshold_z = 30= rather than 37 so the warning fires *before*
+overflow rather than after, giving a cleaner diagnosis (the iteration
+where ẑ first crossed the danger threshold, not the iteration where
+arithmetic broke).
+
+#+begin_src julia-vterm :results nil
+
+const NAN_DIAG_LOCK = ReentrantLock()
+
+"""
+    make_nan_diagnostic(label, architecture, ode_param_ctor, transform;
+                        inner_cb, threshold_z, threshold_nn, threshold_g,
+                        check_every) -> callback
+
+Returns a callback that runs `inner_cb` first, then on the same
+iteration evaluates per-config danger probes. Prints a one-shot
+report the first time any probe trips, including:
+  - which probe fired (ẑ, NN, g, or a NaN/Inf in a loss component)
+  - the iteration number
+  - the values of all probes at that iteration
+  - which mathematical case (A.1/A.2/B.2/etc.) it most resembles
+
+After firing once, the diagnostic stays silent for the rest of the run.
+"""
+function make_nan_diagnostic(label::String, architecture, ode_param_ctor, transform;
+                             inner_cb = (s, l) -> false,
+                             threshold_z::Real  = 30f0,
+                             threshold_nn::Real = 30f0,
+                             threshold_g::Real  = 1f10,
+                             check_every::Int   = 25)
+    fired = Ref(false)
+
+    function cb(state, l)
+        # Always run the inner callback first
+        inner_cb(state, l)
+
+        fired[] && return false
+        state.iter % check_every != 0 && return false
+
+        ps  = state.u
+        ctx = state.p
+        is_s2 = ctx isa PINNCtxStage2
+
+        # ── Probes available in BOTH stages ──────────────────
+        # ẑ on the training grid (the only grid Stage 1 has access to).
+        # In Stage 2 we'd rather use t_dense (catches divergence
+        # *between* observation timepoints), so override below.
+        t_probe = is_s2 ? ctx.t_dense : ctx.t_train
+        ẑ = ctx.predict_state(ps, t_probe)
+        z_min, z_max = extrema(ẑ)
+        z_extreme = max(abs(z_min), abs(z_max))
+
+        loss_d = try loss_Data(ps, ctx) catch; NaN32 end
+        loss_ic = try ctx.skip_ic_loss ? 0f0 : loss_IC(ps, ctx)
+                  catch; NaN32 end
+
+        # ── Stage 2 only probes (g-network, ODE residual) ────
+        g_min = NaN32; g_max = NaN32; g_extreme = NaN32
+        loss_o = NaN32
+
+        if is_s2
+            g = ctx.predict_g(ps, ctx.t_dense)
+            g_min, g_max = extrema(g)
+            g_extreme = max(abs(g_min), abs(g_max))
+            loss_o = try loss_ODE(ps, ctx, architecture, ode_param_ctor)
+                     catch; NaN32 end
+        end
+
+        # ── Trigger conditions ───────────────────────────────
+        # In Stage 1, g and loss_o are NaN by construction (not present),
+        # so don't count them toward `any_nan`.
+        any_nan = !isfinite(l) || !isfinite(loss_d) || !isfinite(loss_ic) ||
+                  !isfinite(z_extreme) ||
+                  (is_s2 && (!isfinite(loss_o) || !isfinite(g_extreme)))
+        z_huge = z_extreme > threshold_z
+        g_huge = is_s2 && g_extreme > threshold_g
+
+        if !(any_nan || z_huge || g_huge)
+            return false
+        end
+
+        fired[] = true
+
+        # ── Print under lock so per-thread output stays coherent ─────
+        lock(NAN_DIAG_LOCK) do
+            stage = is_s2 ? "S2" : "S1"
+            ic_mode = ctx.skip_ic_loss ? "hardwired" : "soft"
+            grid_name = is_s2 ? "t_dense" : "t_train"
+            println("\n" * "="^72)
+            @printf("[%s] DIAGNOSTIC FIRED at iter=%d (%s, %s IC)\n",
+                    label, state.iter, stage, ic_mode)
+            println("-"^72)
+            @printf("  loss (full)      = %s\n",  isfinite(l) ? @sprintf("%.4e", l) : "$(l)")
+            @printf("  loss_Data        = %s\n",  isfinite(loss_d) ? @sprintf("%.4e", loss_d) : "$(loss_d)")
+            @printf("  loss_IC          = %s\n",  isfinite(loss_ic) ? @sprintf("%.4e", loss_ic) : "$(loss_ic)")
+            if is_s2
+                @printf("  loss_ODE         = %s\n",  isfinite(loss_o) ? @sprintf("%.4e", loss_o) : "$(loss_o)")
+            end
+            @printf("  ẑ on %-7s    = [%+.3f, %+.3f]   (|max| = %.2f)\n",
+                    grid_name, z_min, z_max, z_extreme)
+            if is_s2
+                @printf("  g on t_dense     = [%+.3e, %+.3e]   (|max| = %.2e)\n",
+                        g_min, g_max, g_extreme)
+            end
+
+            # Hardwired-IC: print raw NN output too (without t·NN amplification)
+            if ctx.skip_ic_loss
+                # Reconstruct raw NN output: ẑ = z₀ + t·NN ⇒ NN = (ẑ - z₀) / t
+                # Skip t=0 column to avoid 0/0
+                t_safe_idx = findall(t -> t > 0, vec(t_probe))
+                if !isempty(t_safe_idx)
+                    t_safe = t_probe[:, t_safe_idx]
+                    ẑ_safe = ẑ[:, t_safe_idx]
+                    z0_col = reshape(ctx.y0_obs, :, 1)
+                    nn_out = (ẑ_safe .- z0_col) ./ t_safe
+                    nn_min, nn_max = extrema(nn_out)
+                    nn_extreme = max(abs(nn_min), abs(nn_max))
+                    @printf("  NN output alone  = [%+.3f, %+.3f]   (|max| = %.2f)\n",
+                            nn_min, nn_max, nn_extreme)
+                    if nn_extreme < threshold_nn && z_huge
+                        println("  → DIAGNOSIS: case B.2 — NN output is moderate but t·NN amplifies it")
+                        println("    Fix: bound NN output (e.g. tanh final activation) or scale by 1/T")
+                    end
+                end
+            end
+
+            # Diagnose by elimination
+            if is_s2 && !isfinite(loss_o) && isfinite(loss_d) && isfinite(loss_ic)
+                println("  → DIAGNOSIS: ODE-residual term is the source")
+                if z_extreme > 37
+                    println("    Likely case A.1: ẑ overflowed → b^ẑ → Inf in transformed_rhs")
+                elseif z_min < -37
+                    println("    Likely case A.2: ẑ underflowed → chain-rule denom = b^ẑ·ln(b) → 0")
+                elseif g_extreme > threshold_g
+                    println("    Likely runaway g-network — its output dominates the ODE residual")
+                end
+            elseif !isfinite(loss_d) && (!is_s2 || !isfinite(loss_o))
+                println("  → DIAGNOSIS: data term blew up — network output divergence")
+                println("    In Stage 1, only the state network is being trained; check its init.")
+            elseif !isfinite(loss_ic)
+                println("  → DIAGNOSIS: IC loss source — soft IC with extreme ẑ(0)")
+            elseif z_huge && !any_nan
+                println("  → EARLY WARNING: ẑ exceeded safe range but loss is still finite")
+                println("    Catch this BEFORE arithmetic breaks. Lower learning rate or check init.")
+            end
+            println("="^72 * "\n")
+        end
+
+        return false
+    end
+
+    return cb
+end
+#+end_src
+
+#+RESULTS:
+
+** Log-likelihood loss functions
+
+These mirror =supervised_loss= and =unsupervised_loss= from Losses.jl but
+swap =loss_Data= for =loss_Data_NLL_transformed=.  Everything else (IC
+penalty, ODE residual, L1 regularisation, bound penalty, hyper penalty)
+stays identical.
+
+The =σ_NLL= constant is the known multiplicative noise std in log-space
+(=bac_noise_σ= below). Since the network operates in log-coordinates, the
+noise std applies directly to residuals between predictions and transformed
+observations — no need for a numerical floor inside another log() call.
+
+There is no ε_Data in the NLL composites: σ² already plays that role,
+and adding ε_Data on top would be a redundant degree of freedom that
+double-counts the noise model.
+
+#+begin_src julia-vterm :results nil
+
+const σ_NLL = 0.5f0     # multiplicative log-normal noise std (= noise std in log-space)
+
+"""
+    loss_Data_NLL_transformed(ps, ctx) -> Float32
+
+Negative log-likelihood (up to θ-independent constants) under the
+homoscedastic Gaussian noise model in *transformed* coordinates:
+
+    -log p(z_obs | θ) ∝ (1 / 2σ²) Σ (z_obs - ẑ)²
+
+The state predictor `ctx.predict_state` returns ẑ in transformed coords;
+ctx.Y_train must already contain z_obs = forward_state(transform, y_obs)
+in the same coords. The full noisy dataset (all mice flattened) lives
+here, with t_train repeated to match.
+
+This is the maximum-likelihood data-fit objective. No ε_Data weight is
+applied because σ² already determines the term's magnitude. Returns the
+*mean* of squared residuals divided by 2σ² so the loss has the same
+dimensional scaling as the per-observation NLL contribution.
+"""
+function loss_Data_NLL_transformed(ps, ctx)
+    ẑ = ctx.predict_state(ps, ctx.t_train)
+    return Statistics.mean(abs2, vec(ẑ - ctx.Y_train)) / (2f0 * σ_NLL^2)
+end
+
+"""
+    supervised_loss_NLL(ps, ctx, mode) -> Float32
+
+Stage 1 NLL loss. Data term carries no ε_Data — σ² is the noise model.
+The remaining ε's govern non-likelihood terms (L1, IC) that genuinely
+need balancing relative to the likelihood scale.
+"""
+function supervised_loss_NLL(ps, ctx, mode::AbstractHyperMode)
+    hp = resolve_epsilons(ps, ctx, mode)
+    penalty = hyper_penalty(ps, mode)
+
+    L = loss_Data_NLL_transformed(ps, ctx) +                  # σ-weighted internally
+        l1_penalty_state(ps) / (hp.ϵ_L1_state^2 + 1f-6) +
+        penalty
+
+    if !ctx.skip_ic_loss
+        L += loss_IC(ps, ctx) / (hp.ϵ_ic^2 + 1f-6)
+    end
+
+    return 0.5f0 * L
+end
+
+
+"""
+    unsupervised_loss_NLL(ps, ctx, mode, architecture, ode_param_constructor) -> Float32
+
+Stage 2 NLL loss. Data term σ-weighted internally. ODE residual is still
+ε-weighted because it is not a likelihood — it is a soft constraint with
+a separately-tunable strength.
+"""
+function unsupervised_loss_NLL(ps, ctx, mode::AbstractHyperMode,
+                               architecture, ode_param_constructor)
+    hp = resolve_epsilons(ps, ctx, mode)
+    penalty = hyper_penalty(ps, mode)
+
+    L = loss_Data_NLL_transformed(ps, ctx) +                  # σ-weighted internally
+        l1_penalty_state(ps) / (hp.ϵ_L1_state^2 + 1f-6) +
+        loss_ODE(ps, ctx, architecture, ode_param_constructor) /
+            (hp.ϵ_ode^2 + 1f-6) +
+        l1_penalty_g(ps) / (hp.ϵ_L1_g^2 + 1f-6) +
+        bound_loss(ps, ctx) +
+        penalty
+
+    if !ctx.skip_ic_loss
+        L += loss_IC(ps, ctx) / (hp.ϵ_ic^2 + 1f-6)
+    end
+
+    return 0.5f0 * L
+end
+#+end_src
+
+#+RESULTS:
+
+* Baccam model — true ODE and noisy data
+
+#+begin_src julia-vterm
+
+function Baccam_model!(du, u, p, t)
+    T, I, V = u
+    du[1] = -p.β * T * V
+    du[2] =  p.β * T * V - p.δ * I
+    du[3] =  p.p * I     - p.c * V
+end
+
+bac_true_params = (β = 2.7f-5, δ = 4.0f0, p = 1.2f-2, c = 3.0f0)
+bac_u0     = Float32[4.0f8, 0.0f0, 9.3f-2]
+bac_t_span = (0.0f0, 8.0f0)
+bac_t_fine = collect(range(bac_t_span[1], bac_t_span[2], length = 2001))
+
+bac_sol = solve(
+    ODEProblem(Baccam_model!, bac_u0, bac_t_span, bac_true_params),
+    Tsit5(); saveat = bac_t_fine
+)
+bac_sol_array = Array(bac_sol)
+
+println("Baccam ODE solved: $(size(bac_sol_array))")
+#+end_src
+
+#+RESULTS:
+: Baccam ODE solved: (3, 2001)
+
+#+begin_src julia-vterm
+
+rng_bac = MersenneTwister(42)
+bac_noise_σ = 0.5f0
+bac_n_tp    = 10
+bac_n_mice  = 12
+
+bac_idx   = round.(Int, range(1, length(bac_t_fine), length = bac_n_tp))
+bac_t_obs = Float32.(bac_t_fine[bac_idx])
+bac_Y_true = Float32.(bac_sol_array[:, bac_idx])
+
+bac_ε = randn(rng_bac, Float32, 3, bac_n_tp, bac_n_mice)
+bac_Y_noisy = clamp.(
+    bac_Y_true .* exp.(bac_noise_σ .* bac_ε .- 0.5f0 * bac_noise_σ^2),
+    0f0, Inf32
+)
+bac_Y_mean = dropdims(mean(bac_Y_noisy; dims = 3); dims = 3)
+
+# Flattened (state × (n_tp · n_mice)) noisy dataset for the NLL rows.
+# Built via index comprehensions that walk (tp, mouse) in identical order
+# for both arrays, so the (t, y) pairing cannot drift regardless of
+# Julia's column-major conventions. Avoids the reshape+repeat pattern,
+# which silently mis-pairs values when `inner` and `outer` are confused.
+bac_Y_flat = Float32.(hcat([
+    [bac_Y_noisy[s, k, m] for s in 1:3]
+    for k in 1:bac_n_tp, m in 1:bac_n_mice
+]...))                                       # 3 × (n_tp · n_mice)
+bac_t_flat = Float32.([bac_t_obs[k]
+    for k in 1:bac_n_tp, m in 1:bac_n_mice])  |> vec   # length n_tp · n_mice
+
+println("Baccam training data: $(bac_n_tp) timepoints × $(bac_n_mice) mice")
+println("  default rows train on means     : 3 × $(bac_n_tp) = $(3*bac_n_tp) values")
+println("  NLL rows train on full dataset  : 3 × $(bac_n_tp * bac_n_mice) = $(3*bac_n_tp*bac_n_mice) values")
+#+end_src
+
+#+RESULTS:
+: Baccam training data: 10 timepoints × 12 mice
+:   default rows train on means     : 3 × 10 = 30 values
+:   NLL rows train on full dataset  : 3 × 120 = 360 values
+
+* Noisy training data — visualization
+
+Sanity check on the synthetic dataset before training. One panel per state.
+Boxplots show the IQR and whiskers across the 12 mice at each observation
+timepoint, individual mice as faint scatter on top, per-timepoint mean as
+a connected red line, true ODE as a dashed grey reference.
+
+The y-axis is =log10= with a small =plot_floor = 1e-2= offset added to
+every y-value so observations clamped to 0 (where the log-normal noise
+sample would have been negative) remain visible. This matches the
+trajectory plot convention used elsewhere in the notebook.
+
+#+begin_src julia-vterm
+
+fig_data = Figure(size = (1200, 350), fontsize = 11)
+state_labels_data = ["T(t)", "I(t)", "V(t)"]
+plot_floor = 1f-2
+
+# Boxplot width from the gap between adjacent timepoints.
+unique_t = sort(unique(bac_t_obs))
+box_width = length(unique_t) > 1 ?
+    0.6f0 * minimum(diff(unique_t)) : 0.3f0
+
+for si in 1:3
+    ax = Makie.Axis(fig_data[1, si];
+        title  = state_labels_data[si],
+        xlabel = "Days p.i.",
+        ylabel = si == 1 ? "Concentration (+ floor)" : "",
+        yscale = Makie.log10,
+        xgridvisible = true, ygridvisible = true,
+        topspinevisible = false, rightspinevisible = false,
+        xticklabelsize = 9, yticklabelsize = 9,
+        titlesize = 12, titlealign = :left,
+    )
+
+    # Boxplot across mice at each timepoint
+    boxplot!(ax,
+        bac_t_flat,
+        vec(bac_Y_flat[si, :]) .+ plot_floor;
+        width           = box_width,
+        color           = (:grey80, 0.5),
+        whiskerwidth    = 0.4,
+        strokewidth     = 0.8,
+        mediancolor     = :black,
+        medianlinewidth = 1.5,
+        outliercolor    = (:black, 0.0),   # hide — scatter shows them
+        markersize      = 0,
+    )
+
+    # Individual mouse observations
+    scatter!(ax,
+        bac_t_flat,
+        vec(bac_Y_flat[si, :]) .+ plot_floor;
+        color      = (:black, 0.35),
+        markersize = 4,
+    )
+
+    # Per-timepoint mean
+    lines!(ax, bac_t_obs, bac_Y_mean[si, :] .+ plot_floor;
+        color = :firebrick, linewidth = 1.8)
+    scatter!(ax, bac_t_obs, bac_Y_mean[si, :] .+ plot_floor;
+        color = :firebrick, markersize = 7,
+        strokecolor = :white, strokewidth = 1)
+
+    # True ODE for reference
+    lines!(ax, bac_t_fine, bac_sol_array[si, :] .+ plot_floor;
+        color = :grey50, linewidth = 1.2, linestyle = :dash)
+end
+
+Legend(fig_data[2, 1:3],
+    [LineElement(color = :grey50, linewidth = 1.2, linestyle = :dash),
+     MarkerElement(marker = :rect, markersize = 12, color = (:grey80, 0.5),
+                   strokecolor = :black, strokewidth = 0.8),
+     MarkerElement(marker = :circle, markersize = 6, color = (:black, 0.35)),
+     LineElement(color = :firebrick, linewidth = 1.8)],
+    ["True ODE", "Mouse boxplot", "Individual mice", "Per-timepoint mean"],
+    orientation = :horizontal, tellwidth = false, labelsize = 9)
+
+Label(fig_data[0, 1:3],
+    "Synthetic Baccam dataset — $(bac_n_mice) mice × $(bac_n_tp) timepoints, log-normal noise σ=$(bac_noise_σ)";
+    fontsize = 13, tellwidth = false)
+
+display(fig_data)
+# save(joinpath("Experiments","Loss-function-exploration","Results", "training-data.pdf"), fig_data, px_per_unit = 600/72)
+#+end_src
+
+#+RESULTS:
+
+* Architecture pieces
+
+** Common ODE / parameter struct
+
+#+begin_src julia-vterm :results nil
+
+struct BaccamParams{T<:AbstractFloat}
+    β::T; δ::T; c::T
+end
+BaccamParams(nt::ComponentVector) = BaccamParams(nt.β, nt.δ, nt.c)
+
+function BaccamArchitectureRaw(y, g, p::BaccamParams)
+    T, I, V = y[1,:], y[2,:], y[3,:]
+    g_T, g_V = g[1,:], g[2,:]
+    dT = g_T
+    dI = p.β .* T .* V .- p.δ .* I
+    dV = g_V .- p.c .* V
+    return permutedims(hcat(dT, dI, dV))
+end
+
+# g network is the same regardless of which row of the matrix we're in —
+# its output is in raw coordinates either way and the magnitudes are
+# moderate.
+bac_build_g_mlp() = Lux.Chain(
+    Lux.Dense(1, 6, tanh_fast),
+    Lux.Dense(6, 4, tanh_fast),
+    Lux.Dense(4, 2),
+)
+#+end_src
+
+#+RESULTS:
+
+** State MLP — default (linear output, used with log+zscore transform)
+
+#+begin_src julia-vterm :results nil
+
+bac_build_state_mlp_default() = Lux.Chain(
+    Lux.Dense(1, 8, tanh_fast),
+    Lux.Dense(8, 6, tanh_fast),
+    Lux.Dense(6, 3),
+)
+#+end_src
+
+#+RESULTS:
+
+** State MLP — NLL rows (same plain linear-output MLP as default)
+
+With the NLL rows now operating on the same =LogTransform= as the default
+rows, the network output is in log10 coordinates and a plain linear-output
+MLP works fine. No sinh activation, no per-state scaling. The architectural
+difference between rows that existed in the previous version is gone — the
+only difference now is the loss function and the dataset shape.
+
+#+begin_src julia-vterm :results nil
+
+# Same builder as the default row — NLL rows reuse it.
+bac_build_state_mlp_nll() = bac_build_state_mlp_default()
+#+end_src
+
+#+RESULTS:
+
+* Transforms and data packing
+
+** Shared LogTransform for both rows
+
+Both the default-MSE rows and the NLL rows operate in log10-coordinates.
+The transform is identical — the only difference between rows is the
+loss function and which Y_train tensor is supplied.
+
+#+begin_src julia-vterm :results nil
+
+bac_transform = LogTransform(
+    10f0,
+    Float32[1f-3, 1f-3, 1f-3],
+    Bool[true, true, true],
+)
+#+end_src
+
+#+RESULTS:
+
+** Data tuples — means for default rows, full mouse data for NLL rows
+
+Default rows train on the per-timepoint mean of mice (10 values per
+state). NLL rows train on the full noisy dataset (120 values per state)
+so every mouse observation contributes an independent likelihood term.
+
+Both data tuples carry the same =t_dense=, =t_span=, =y0_init=, and ODE
+parameter init/bounds — only =t_train= and =Y_train= differ.
+
+#+begin_src julia-vterm :results nil
+
+bac_t_train_default = permutedims(bac_t_obs)              # 1 × 10
+bac_t_train_nll     = permutedims(bac_t_flat)             # 1 × 120
+bac_t_dense = permutedims(Float32.(range(
+    minimum(bac_t_obs), maximum(bac_t_obs); length = 1000)))
+bac_t_span_vec = Float32[minimum(bac_t_obs), maximum(bac_t_obs)]
+
+bac_data_default = (
+    t_train        = bac_t_train_default,
+    Y_train        = bac_Y_mean,                          # 3 × 10 means
+    Y_train_std    = ones(Float32, 3, 1),
+    t_dense        = bac_t_dense,
+    t_span         = bac_t_span_vec,
+    y0_init        = bac_u0,
+    ODE_par_init   = (β = 1.0f-4, δ = 1.0f0, c = 1.0f0),
+    ODE_par_bounds = (β = Float32[0, 1f-2],
+                      δ = Float32[0, 20],
+                      c = Float32[0, 20]),
+)
+
+bac_data_nll = (
+    t_train        = bac_t_train_nll,
+    Y_train        = bac_Y_flat,                          # 3 × 120 raw mouse data
+    Y_train_std    = ones(Float32, 3, 1),
+    t_dense        = bac_t_dense,
+    t_span         = bac_t_span_vec,
+    y0_init        = bac_u0,
+    ODE_par_init   = (β = 1.0f-4, δ = 1.0f0, c = 1.0f0),
+    ODE_par_bounds = (β = Float32[0, 1f-2],
+                      δ = Float32[0, 20],
+                      c = Float32[0, 20]),
+)
+#+end_src
+
+#+RESULTS:
+
+* Hyperparameters and iteration budget
+
+#+begin_src julia-vterm :results nil
+
+# Stage 1 / Stage 2 budgets — modest for a first comparison
+bac_maxiters_s1 = 50_000
+bac_maxiters_s2 = 80_000
+bac_lr = 1f-4
+
+#                                ϵ_ic    ϵ_ode   ϵ_Data   ϵ_L1_s   ϵ_L1_g
+bac_hp_default_soft = HyperParams(0.1f0,  0.1f0,  4f-2,    0.5f0,   0.5f0)
+bac_hp_default_hard = HyperParams(0f0,    0.1f0,  4f-2,    0.5f0,   0.5f0)
+bac_hp_nll_soft     = HyperParams(0.1f0,  0.1f0,  4f-2,    0.5f0,   0.5f0)
+bac_hp_nll_hard     = HyperParams(0f0,    0.1f0,  4f-2,    0.5f0,   0.5f0)
+#+end_src
+
+#+RESULTS:
+
+* Mode configurations
+
+Each cell of the 2×2 matrix is a NamedTuple with everything =train()=
+needs for that combination. Both rows share the =LogTransform= and the
+plain linear-output MLP; the difference is the loss function and the
+shape of =Y_train= (means vs full mouse data).
+
+  - ="default_soft"=    Default MSE loss + Log + Soft IC + means
+  - ="default_hard"=    Default MSE loss + Log + Hardwired IC + means
+  - ="nll_soft"=        Gaussian NLL + Log + Soft IC + full mouse data
+  - ="nll_hard"=        Gaussian NLL + Log + Hardwired IC + full mouse data
+
+#+begin_src julia-vterm :results nil
+
+bac_mode_configs = Dict(
+    "default_soft" => (
+        arch_mode       = LuxMLP(),
+        hp              = bac_hp_default_soft,
+        transform       = bac_transform,
+        data            = bac_data_default,
+        sup_loss        = supervised_loss,
+        unsup_loss      = unsupervised_loss,
+        build_state_mlp = bac_build_state_mlp_default,
+        track_data_loss = loss_Data,
+    ),
+    "default_hard" => (
+        arch_mode       = LuxMLPHardwiredIC(),
+        hp              = bac_hp_default_hard,
+        transform       = bac_transform,
+        data            = bac_data_default,
+        sup_loss        = supervised_loss,
+        unsup_loss      = unsupervised_loss,
+        build_state_mlp = bac_build_state_mlp_default,
+        track_data_loss = loss_Data,
+    ),
+    "nll_soft" => (
+        arch_mode       = LuxMLP(),
+        hp              = bac_hp_nll_soft,
+        transform       = bac_transform,
+        data            = bac_data_nll,
+        sup_loss        = supervised_loss_NLL,
+        unsup_loss      = unsupervised_loss_NLL,
+        build_state_mlp = bac_build_state_mlp_nll,
+        track_data_loss = loss_Data_NLL_transformed,
+    ),
+    "nll_hard" => (
+        arch_mode       = LuxMLPHardwiredIC(),
+        hp              = bac_hp_nll_hard,
+        transform       = bac_transform,
+        data            = bac_data_nll,
+        sup_loss        = supervised_loss_NLL,
+        unsup_loss      = unsupervised_loss_NLL,
+        build_state_mlp = bac_build_state_mlp_nll,
+        track_data_loss = loss_Data_NLL_transformed,
+    ),
+)
+#+end_src
+
+#+RESULTS:
+
+* Training (parallel)
+
+Run each cell on its own thread.  Start Julia with at least 4 threads
+(=julia -t 4= or =JULIA_NUM_THREADS=4=).  BLAS threads are pinned to 1 per
+task so optimisers don't contend.
+
+#+begin_src julia-vterm
+
+using Base.Threads
+
+function callback_iter1000(state, l)
+    state.iter % 1000 == 0 || return false
+    stage = state.p isa PINNCtxStage2 ? "S2" : "S1"
+    @printf("[%s] iter = %6d  loss = %.4e\n", stage, state.iter, l)
+    return false
+end
+
+bac_tasks = Dict{String, Task}()
+bac_loss_histories = Dict{String, Any}()
+
+for (label, cfg) in bac_mode_configs
+    tracker_cb, hist = make_loss_tracker(
+        BaccamArchitectureRaw, BaccamParams, bac_maxiters_s1;
+        data_loss_fn = cfg.track_data_loss,
+    )
+    bac_loss_histories[label] = hist
+
+    # Chain: every iteration calls iter1000 (printout), then tracker
+    # (history collection), then nan_diag (one-shot blow-up report).
+    chained_cb(state, l) = (
+        callback_iter1000(state, l);
+        tracker_cb(state, l);
+        false
+    )
+
+    nan_cb = make_nan_diagnostic(
+        label, BaccamArchitectureRaw, BaccamParams, cfg.transform;
+        inner_cb     = chained_cb,
+        threshold_z  = 30f0,    # warn before b^ẑ overflows at 37
+        threshold_g  = 1f10,    # g shouldn't exceed ~peak physics scale
+        check_every  = 25,      # cheap; runs roughly every 25 iters
+    )
+
+    bac_tasks[label] = Threads.@spawn begin
+        println("[Thread $(Threads.threadid())] Baccam — Starting $label")
+
+        # Suppress Optimisers.jl's "NaN or Inf encountered" warning during
+        # the train() call. Our nan_cb diagnostic catches and reports these
+        # cases with full context (which loss term, which probe, which
+        # iteration), so the built-in warning is redundant noise — and at
+        # one warning per affected gradient step it can swamp the output.
+        # `with_logger(NullLogger())` discards all `@warn`/`@info` calls
+        # inside the wrapped block. `println` output (our diagnostic) is
+        # unaffected because it doesn't go through the logging system.
+        stats = with_logger(NullLogger()) do
+            @timed train(
+                FixedHyper(),
+                cfg.data,
+                BaccamArchitectureRaw,
+                BaccamParams,
+                cfg.hp;
+                transform                  = cfg.transform,
+                arch_mode                  = cfg.arch_mode,
+                seed                       = 1,
+                maxiters_stage1            = bac_maxiters_s1,
+                maxiters_stage2            = bac_maxiters_s2,
+                Opt_alg_stage1             = OptimizationOptimisers.Adam(bac_lr),
+                Opt_alg_stage2             = OptimizationOptimisers.Adam(bac_lr),
+                build_state_mlp            = cfg.build_state_mlp,
+                build_g_mlp                = bac_build_g_mlp,
+                callback_function          = nan_cb,
+                default_supervised_loss    = cfg.sup_loss,
+                default_unsupervised_loss  = cfg.unsup_loss,
+            )
+        end
+        res = stats.value
+
+        (res = res, time_s = stats.time, cfg = cfg)
+    end
+end
+
+bac_results = Dict{String, Any}()
+ for (label, t) in bac_tasks
+    bac_results[label] = fetch(t)
+    r = bac_results[label]
+    @printf("\n  [Baccam %s] Wall: %.1fs  Data: %.4e  ODE: %.4e\n",
+            label, r.time_s, r.res.metrics.data_mse, r.res.metrics.ode_mse)
+    @printf("  [Baccam %s] β = %.2e (true 2.7e-5)  δ = %.3f (true 4.0)  c = %.3f (true 3.0)\n",
+            label, r.res.params.ODE_par.β, r.res.params.ODE_par.δ, r.res.params.ODE_par.c)
+end
+
+#+end_src
+
+#+RESULTS:
+
+* Diagnostics
+
+** Mode order and styling
+
+#+begin_src julia-vterm :results nil
+
+mode_order = ["default_soft", "default_hard", "nll_soft",
+              "nll_hard"
+              ]
+mode_labels = ["Default + Soft", "Default + Hardwired",
+               "NLL + Soft",
+               "NLL + Hardwired"
+               ]
+mode_colors = Dict(
+    "default_soft" => :royalblue,
+    "default_hard" => :darkorange,
+    "nll_soft"     => :forestgreen,
+    "nll_hard"     => :firebrick,
+)
+#+end_src
+
+#+RESULTS:
+
+** Trajectory fits
+
+State trajectories per cell.  Each column is a mode, each row a state.
+Predictions live in different transformed coordinates per row of the
+matrix, but =inverse_state= on each cell's transform brings them back to
+raw coordinates so they can be compared against the true ODE.
+
+#+begin_src julia-vterm
+
+fig = Figure(size = (1400, 700), fontsize = 11)
+state_labels = ["T(t)", "I(t)", "V(t)"]
+plot_floor = 1f-2
+
+t_eval = permutedims(Float32.(range(bac_t_span[1], bac_t_span[2]; length = 300)))
+
+for (col, mode_key) in enumerate(mode_order)
+    r   = bac_results[mode_key]
+    cfg = r.cfg
+    ps  = r.res.params
+    ctx = r.res.ctx2
+
+    ŷ_in_loss_coords = ctx.predict_state(ps, t_eval)
+    ŷ_raw            = inverse_state(cfg.transform, ŷ_in_loss_coords)
+
+    for si in 1:3
+        ax = Makie.Axis(fig[si, col];
+            title  = si == 1 ? mode_labels[col] : "",
+            xlabel = si == 3 ? "Days p.i." : "",
+            ylabel = col == 1 ? state_labels[si] : "",
+            yscale = Makie.log10,
+            xgridvisible = true, ygridvisible = true,
+            topspinevisible = false, rightspinevisible = false,
+            xticklabelsize = 8, yticklabelsize = 8,
+            titlesize = 11,
+        )
+
+        lines!(ax, bac_t_fine, bac_sol_array[si, :] .+ plot_floor;
+            color = :grey60, linewidth = 1.5, linestyle = :dash)
+        lines!(ax, vec(t_eval), ŷ_raw[si, :] .+ plot_floor;
+            color = mode_colors[mode_key], linewidth = 2)
+
+        # NLL rows trained on full mouse data — show individual mice;
+        # default rows trained on means — show the means as scatter.
+        if startswith(mode_key, "nll")
+            scatter!(ax, vec(bac_t_flat), vec(bac_Y_flat[si, :]) .+ plot_floor;
+                color = (:black, 0.25), markersize = 3)
+        else
+            scatter!(ax, bac_t_obs, bac_Y_mean[si, :] .+ plot_floor;
+                color = :black, markersize = 5)
+        end
+    end
+end
+
+Legend(fig[4, 1:4],
+    [LineElement(color = :grey60, linewidth = 1.5, linestyle = :dash),
+     MarkerElement(marker = :circle, markersize = 7, color = :black)],
+    ["True ODE", "Training mean"],
+    orientation = :horizontal, tellwidth = false)
+
+display(fig)
+# save(joinpath("Experiments","Loss-function-exploration","Results", "state-trajectory-comp.pdf"), fig, px_per_unit = 600/72)
+#+end_src
+
+#+RESULTS:
+
+** Loss dynamics
+
+Both loss curves (data + ODE) on a log-y axis.  Note that "Data" means
+different things across rows of the matrix: MSE-in-transformed-coords
+for the default rows, NLL for the NLL rows.  Magnitudes aren't directly
+comparable across rows; only within-row trends are meaningful.
+
+#+begin_src julia-vterm
+
+fig_loss = Figure(size = (1200, 500), fontsize = 11)
+
+# Data loss
+ax_d = Makie.Axis(fig_loss[1, 1];
+    title  = "Data loss (MSE for default rows, NLL for NLL rows)",
+    xlabel = "",
+    ylabel = "Data loss",
+    yscale = Makie.log10,
+    xgridvisible = true, ygridvisible = true,
+    topspinevisible = false, rightspinevisible = false,
+    xticklabelsize = 8, yticklabelsize = 8)
+
+vlines!(ax_d, [bac_maxiters_s1]; color = :grey50, linestyle = :dash, linewidth = 1)
+
+for label in mode_order
+    hist = bac_loss_histories[label]
+    isempty(hist.iter) && continue
+    lines!(ax_d, hist.iter, hist.data_mse;
+        color = mode_colors[label], linewidth = 1.2, label = label)
+end
+
+# ODE residual
+ax_o = Makie.Axis(fig_loss[2, 1];
+    title  = "ODE residual MSE",
+    xlabel = "Iteration (global)",
+    ylabel = "ODE MSE",
+    yscale = Makie.log10,
+    xgridvisible = true, ygridvisible = true,
+    topspinevisible = false, rightspinevisible = false,
+    xticklabelsize = 8, yticklabelsize = 8)
+
+vlines!(ax_o, [bac_maxiters_s1]; color = :grey50, linestyle = :dash, linewidth = 1)
+
+for label in mode_order
+    hist = bac_loss_histories[label]
+    isempty(hist.iter) && continue
+    omask = .!isnan.(hist.ode_mse)
+    any(omask) || continue
+    lines!(ax_o, hist.iter[omask], hist.ode_mse[omask];
+        color = mode_colors[label], linewidth = 1.2)
+end
+
+Makie.linkxaxes!(ax_d, ax_o)
+
+# Shared legend for both panels — built from mode_order/mode_colors
+# rather than from labeled plots, so it renders correctly regardless of
+# whether all four training runs have populated their histories yet.
+Legend(fig_loss[3, 1],
+    [LineElement(color = mode_colors[label], linewidth = 1.5)
+     for label in mode_order],
+    [mode_labels[i] for i in eachindex(mode_order)];
+    orientation = :horizontal, tellwidth = false, labelsize = 9)
+
+Label(fig_loss[0, 1],
+    "Training loss dynamics — Stage 1 | Stage 2 (dashed line = transition)";
+    fontsize = 13, tellwidth = false)
+
+# display(fig_loss)
+save(joinpath("Experiments","Loss-function-exploration","Results", "loss-dynamics.pdf"), fig_loss, px_per_unit = 600/72)
+#+end_src
+
+#+RESULTS:
+
+* Summary
+
+#+begin_src julia-vterm
+
+println("\n", "="^85)
+println("  Baccam — Default Loss vs Log-Likelihood Loss")
+println("  True parameters: β=2.7e-5, δ=4.0, c=3.0")
+println("="^85)
+@printf("  %-22s  %-12s  %-12s  %-10s  %-10s  %-10s  %-8s\n",
+        "Mode", "Data",  "ODE",  "β_rec",   "δ_rec",   "c_rec",   "Wall(s)")
+println("  ", "-"^81)
+
+for label in mode_order
+    r = bac_results[label]
+    @printf("  %-22s  %.4e  %.4e  %.2e    %-10.3f  %-10.3f  %8.1f\n",
+            label,
+            r.res.metrics.data_mse, r.res.metrics.ode_mse,
+            r.res.params.ODE_par.β, r.res.params.ODE_par.δ, r.res.params.ODE_par.c,
+            r.time_s)
+end
+
+println("\nWhat to look for:")
+println("  • If NLL rows show smaller ODE residual than default rows,")
+println("    the chain-rule singularity in the log transform was hurting convergence.")
+println("  • If hardwired IC works for NLL but not for default,")
+println("    confirms the hardwired+log interaction was the issue, not hardwired IC itself.")
+println("  • β recovery is the most discriminating parameter — the others are easier.")
+#+end_src
+
+#+RESULTS:
