@@ -24,7 +24,7 @@ Deriv dispatches govern `make_deriv_predictor`; the two never see each other.
 
 using Lux, NNlib
 using ForwardDiff
-using FiniteDiff
+# using FiniteDiff
 
 
 #=-------------------------------------------------------------------------------
@@ -70,13 +70,6 @@ Base.@kwdef struct HandFD <: AbstractDerivMode
 end
 
 """
-FiniteDiff.jl central-difference derivative.  Uses the package's
-default step-size selection (Richardson-style heuristic), giving
-better accuracy than `HandFD` at similar cost.
-"""
-struct FiniteDiffJL <: AbstractDerivMode end
-
-"""
 ForwardDiff.jl exact derivative via dual numbers.
 
 Used inside an outer Zygote pass (the Optimization.jl gradient),
@@ -99,7 +92,6 @@ LuxMLP architecture, parameterised on IC and derivative modes.
 Examples:
 - `LuxMLP()` — soft IC, hand FD (matches the previous default)
 - `LuxMLP(SoftIC(), ForwardDiffAD())` — soft IC, exact AD derivative
-- `LuxMLP(HardwiredIC(), FiniteDiffJL())` — hardwired IC, FiniteDiff.jl
 
 Fields are independent; `build_predictors` composes them.
 """
@@ -189,29 +181,6 @@ function make_deriv_predictor(d::HandFD, predict_state)
     h = d.h
     function predict_deriv(ps, t_grid::AbstractMatrix)
         return (predict_state(ps, t_grid .+ h) .- predict_state(ps, t_grid .- h)) ./ (2f0 * h)
-    end
-    return predict_deriv
-end
-
-"""
-    make_deriv_predictor(d, predict_state) -> (ps, t_grid) -> dstate_dt
-
-FiniteDiff.jl central-difference derivative with adaptive step size.
-Per-column evaluation: each time point gets its own scalar derivative.
-
-Uses `reduce(hcat, cols)` rather than mutation so Zygote can trace it.
-"""
-function make_deriv_predictor(::FiniteDiffJL, predict_state)
-    function predict_deriv(ps, t_grid::AbstractMatrix)
-        B = size(t_grid, 2)
-        cols = map(1:B) do j
-            tj = t_grid[1, j]
-            FiniteDiff.finite_difference_derivative(
-                t -> vec(predict_state(ps, reshape([t], 1, 1))),
-                tj,
-            )
-        end
-        return reduce(hcat, cols)
     end
     return predict_deriv
 end
