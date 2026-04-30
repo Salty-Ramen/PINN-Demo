@@ -167,10 +167,10 @@ end
 function Normalize_Data_for_ODE_dispatch(data,
                                          ::Val{:AllFreeODEParams})
 
-    return haskey(data, :ODE_par_init) ? data : merge(data, (ODE_par_init = NamedTuple()))
+    return haskey(data, :ODE_par_fixed) ? data : merge(data, (ODE_par_fixed = NamedTuple()))
 end
 
-Normalize_Data_for_ODE_dispatch(data, ::Val{:SomeFixedODEParams}) = data
+Normalize_Data_for_ODE_dispatch(data, ::Val{:SomeFixedODEParams}) = datac
 
 
 
