@@ -1,0 +1,452 @@
+#+TITLE: Baccam — Hardwired IC + Gaussian NLL (All Fixed vs Some Fixed ODE Parameters)
+#+AUTHOR: Ramakrishna Suresh
+#+PROPERTY: header-args:julia-vterm :session *julia* :results output :exports both :dir (projectile-project-root) :tangle yes :comments both
+#+STARTUP: inlineimages overview
+
+* Goal
+
+This notebook is fully self-contained and runnable.
+It tests *Hardwired IC + Gaussian log-likelihood loss* for Baccam with two
+ODE-parameter policies:
+
+1. *All fixed:* keep =(β, δ, c)= fixed during training.
+2. *Some fixed:* train β and c, keep δ fixed.
+
+Template basis: =Experiments/Loss-function-exploration/Baccam-nll-vs-default-compare.org=,
+but narrowed to only the Hardwired+NLL branch.
+
+* Setup
+
+** Boilerplate
+
+#+begin_src julia-vterm :results nil
+using Pkg
+Pkg.activate(".")
+
+using ComponentArrays
+using Lux, NNlib
+using Optimization, OptimizationOptimisers, OptimizationOptimJL
+using Statistics
+using Random
+using OrdinaryDiffEq
+using CairoMakie, Makie
+using Printf
+using LinearAlgebra
+using Base.Threads
+BLAS.set_num_threads(1)
+
+include(joinpath(pwd(), "Src", "Fitting.jl"))
+#+end_src
+
+#+RESULTS:
+
+** Loss tracker
+
+#+begin_src julia-vterm :results nil
+function make_loss_tracker(architecture, ode_param_ctor, maxiters_s1;
+                           log_every::Int = 100,
+                           data_loss_fn = loss_Data,
+                           param_train_mode::Symbol = :AllFreeODEParams)
+    hist = (
+        iter     = Int[],
+        data_mse = Float32[],
+        ode_mse  = Float32[],
+        stage    = Int[],
+    )
+
+    function cb(state, l)
+        state.iter % log_every != 0 && return false
+
+        ps  = state.u
+        ctx = state.p
+
+        is_s2 = ctx isa PINNCtxStage2
+        global_iter = is_s2 ? maxiters_s1 + state.iter : state.iter
+
+        d_mse = data_loss_fn(ps, ctx)
+        o_mse = is_s2 ? loss_ODE(ps, ctx, architecture, ode_param_ctor,
+                                 param_train_mode) : NaN32
+
+        push!(hist.iter,     global_iter)
+        push!(hist.data_mse, d_mse)
+        push!(hist.ode_mse,  o_mse)
+        push!(hist.stage,    is_s2 ? 2 : 1)
+
+        return false
+    end
+
+    return cb, hist
+end
+#+end_src
+
+#+RESULTS:
+
+** NLL loss functions
+
+#+begin_src julia-vterm :results nil
+const σ_NLL = 0.5f0
+
+function loss_Data_NLL_transformed(ps, ctx)
+    ẑ = ctx.predict_state(ps, ctx.t_train)
+    return Statistics.mean(abs2, vec(ẑ - ctx.Y_train)) / (2f0 * σ_NLL^2)
+end
+
+function supervised_loss_NLL(ps, ctx, mode::AbstractHyperMode)
+    hp = resolve_epsilons(ps, ctx, mode)
+    penalty = hyper_penalty(ps, mode)
+
+    L = loss_Data_NLL_transformed(ps, ctx) +
+        l1_penalty_state(ps) / (hp.ϵ_L1_state^2 + 1f-6) +
+        penalty
+
+    if !ctx.skip_ic_loss
+        L += loss_IC(ps, ctx) / (hp.ϵ_ic^2 + 1f-6)
+    end
+
+    return 0.5f0 * L
+end
+
+function unsupervised_loss_NLL(ps, ctx, mode::AbstractHyperMode,
+                               architecture, ode_param_constructor,
+                               param_train_mode::Symbol)
+    hp = resolve_epsilons(ps, ctx, mode)
+    penalty = hyper_penalty(ps, mode)
+
+    # No soft bound penalty here (intentional for these NLL runs).
+    L = loss_Data_NLL_transformed(ps, ctx) +
+        l1_penalty_state(ps) / (hp.ϵ_L1_state^2 + 1f-6) +
+        loss_ODE(ps, ctx, architecture, ode_param_constructor,
+                 param_train_mode) / (hp.ϵ_ode^2 + 1f-6) +
+        l1_penalty_g(ps) / (hp.ϵ_L1_g^2 + 1f-6) +
+        penalty
+
+    if !ctx.skip_ic_loss
+        L += loss_IC(ps, ctx) / (hp.ϵ_ic^2 + 1f-6)
+    end
+
+    return 0.5f0 * L
+end
+#+end_src
+
+#+RESULTS:
+
+* Baccam model and synthetic data
+
+#+begin_src julia-vterm
+function Baccam_model!(du, u, p, t)
+    T, I, V = u
+    du[1] = -p.β * T * V
+    du[2] =  p.β * T * V - p.δ * I
+    du[3] =  p.p * I     - p.c * V
+end
+
+bac_true_params = (β = 2.7f-5, δ = 4.0f0, p = 1.2f-2, c = 3.0f0)
+bac_u0     = Float32[4.0f8, 0.0f0, 9.3f-2]
+bac_t_span = (0.0f0, 8.0f0)
+bac_t_fine = collect(range(bac_t_span[1], bac_t_span[2], length = 2001))
+
+bac_sol = solve(
+    ODEProblem(Baccam_model!, bac_u0, bac_t_span, bac_true_params),
+    Tsit5(); saveat = bac_t_fine
+)
+bac_sol_array = Array(bac_sol)
+
+rng_bac = MersenneTwister(42)
+bac_noise_σ = 0.5f0
+bac_n_tp    = 10
+bac_n_mice  = 12
+
+bac_idx    = round.(Int, range(1, length(bac_t_fine), length = bac_n_tp))
+bac_t_obs  = Float32.(bac_t_fine[bac_idx])
+bac_Y_true = Float32.(bac_sol_array[:, bac_idx])
+
+bac_ε = randn(rng_bac, Float32, 3, bac_n_tp, bac_n_mice)
+bac_Y_noisy = clamp.(
+    bac_Y_true .* exp.(bac_noise_σ .* bac_ε .- 0.5f0 * bac_noise_σ^2),
+    0f0, Inf32
+)
+bac_Y_mean = dropdims(mean(bac_Y_noisy; dims = 3); dims = 3)
+
+# Flatten full mouse dataset for NLL rows.
+bac_Y_flat = Float32.(hcat([
+    [bac_Y_noisy[s, k, m] for s in 1:3]
+    for k in 1:bac_n_tp, m in 1:bac_n_mice
+]...))
+bac_t_flat = Float32.([
+    bac_t_obs[k] for k in 1:bac_n_tp, m in 1:bac_n_mice
+]) |> vec
+
+println("Baccam training data: $(bac_n_tp) timepoints × $(bac_n_mice) mice")
+println("NLL matrix shape: Y=$(size(bac_Y_flat)), t=$(length(bac_t_flat))")
+#+end_src
+
+#+RESULTS:
+: Baccam training data: 10 timepoints × 12 mice
+: NLL matrix shape: Y=(3, 120), t=120
+
+* Architecture pieces
+
+#+begin_src julia-vterm :results nil
+struct BaccamParams{T<:AbstractFloat}
+    β::T; δ::T; c::T
+end
+BaccamParams(nt) = BaccamParams(nt.β, nt.δ, nt.c)
+
+function BaccamArchitectureRaw(y, g, p::BaccamParams)
+    T, I, V = y[1,:], y[2,:], y[3,:]
+    g_T, g_V = g[1,:], g[2,:]
+    dT = g_T
+    dI = p.β .* T .* V .- p.δ .* I
+    dV = g_V .- p.c .* V
+    return permutedims(hcat(dT, dI, dV))
+end
+
+bac_build_state_mlp() = Lux.Chain(
+    Lux.Dense(1, 8, tanh_fast),
+    Lux.Dense(8, 6, tanh_fast),
+    Lux.Dense(6, 3),
+)
+
+bac_build_g_mlp() = Lux.Chain(
+    Lux.Dense(1, 6, tanh_fast),
+    Lux.Dense(6, 4, tanh_fast),
+    Lux.Dense(4, 2),
+)
+#+end_src
+
+#+RESULTS:
+
+* Transform and per-policy data tuples (NLL + Hardwired IC)
+
+The two policies differ only in how the ODE parameters are split between
+=ODE_par_init= (trainable, lives in =ps.ODE_par=) and =ODE_par_fixed= (read
+from =ctx.ODE_par_fixed=, never updated).
+
+- *All fixed* (=:AllFixedODEParams=): =ODE_par_init = ()=, all three params in
+  =ODE_par_fixed=.  The trainable =ps.ODE_par= is empty, so the per-run
+  printing has to read =ctx2.ODE_par_fixed= for this case (handled below).
+- *Some fixed* (=:SomeFixedODEParams=): only =δ= is in =ODE_par_fixed=; =β=
+  and =c= live in =ODE_par_init= and are trained.
+
+#+begin_src julia-vterm :results nil
+bac_transform = LogTransform(
+    10f0,
+    Float32[1f-3, 1f-3, 1f-3],
+    Bool[true, true, true],
+)
+
+bac_t_train_nll = permutedims(bac_t_flat)  # 1 × (n_tp*n_mice)
+bac_t_dense = permutedims(Float32.(range(
+    minimum(bac_t_obs), maximum(bac_t_obs); length = 1000)))
+bac_t_span_vec = Float32[minimum(bac_t_obs), maximum(bac_t_obs)]
+
+bac_data_common = (
+    t_train     = bac_t_train_nll,
+    Y_train     = bac_Y_flat,
+    Y_train_std = ones(Float32, 3, 1),
+    t_dense     = bac_t_dense,
+    t_span      = bac_t_span_vec,
+    y0_init     = bac_u0,
+)
+
+# All fixed: nothing trainable in ODE_par; all three in ODE_par_fixed.
+bac_data_all_fixed = merge(bac_data_common, (
+    ODE_par_init  = NamedTuple(),
+    ODE_par_fixed = (β = 1.0f-4, δ = 1.0f0, c = 1.0f0),
+    ODE_par_bounds = NamedTuple(),  # required by build_contexts; unused (no bound_loss in NLL runs)
+))
+
+# Some fixed: train β and c, freeze δ.
+bac_data_some_fixed = merge(bac_data_common, (
+    ODE_par_init  = (β = 1.0f-4, c = 1.0f0),
+    ODE_par_fixed = (δ = 1.0f0,),
+    ODE_par_bounds = NamedTuple(),  # required by build_contexts; unused (no bound_loss in NLL runs)
+))
+#+end_src
+
+#+RESULTS:
+
+* Hyperparameters and ODE policies
+
+#+begin_src julia-vterm :results nil
+bac_maxiters_s1 = 50_000
+bac_maxiters_s2 = 50_000   # Adam gradient steps for Stage 2
+bac_lr = 1f-4
+
+#                        ϵ_ic   ϵ_ode  ϵ_Data  ϵ_L1_s  ϵ_L1_g
+bac_hp_hard_nll = HyperParams(0f0,   0.1f0, 4f-2,   0.5f0,  0.5f0)
+
+# Param training modes (Symbol, dispatched via Val(...) inside loss_ODE).
+mode_all_fixed  = :AllFixedODEParams
+mode_some_fixed = :SomeFixedODEParams
+#+end_src
+
+#+RESULTS:
+
+* Training runner
+
+#+begin_src julia-vterm :results nil
+function run_hardwired_nll_case(label::String, data, param_train_mode::Symbol;
+                                 seed::Int,
+                                 maxiters_stage1::Int = bac_maxiters_s1,
+                                 maxiters_stage2::Int = bac_maxiters_s2)
+
+    tracker_cb, hist = make_loss_tracker(
+        BaccamArchitectureRaw, BaccamParams, maxiters_stage1;
+        log_every        = 100,
+        data_loss_fn     = loss_Data_NLL_transformed,
+        param_train_mode = param_train_mode,
+    )
+
+    stats = @timed res = train(
+        FixedHyper(),
+        data,
+        BaccamArchitectureRaw,
+        BaccamParams,
+        bac_hp_hard_nll;
+        transform                  = bac_transform,
+        arch_mode                  = LuxMLPHardwiredIC(),
+        param_train_mode           = param_train_mode,
+        seed                       = seed,
+        maxiters_stage1            = maxiters_stage1,
+        maxiters_stage2            = maxiters_stage2,
+        Opt_alg_stage1             = OptimizationOptimisers.Adam(bac_lr),
+        Opt_alg_stage2             = OptimizationOptimisers.Adam(bac_lr),
+        build_state_mlp            = bac_build_state_mlp,
+        build_g_mlp                = bac_build_g_mlp,
+        callback_function          = tracker_cb,
+        default_supervised_loss    = supervised_loss_NLL,
+        default_unsupervised_loss  = unsupervised_loss_NLL,
+    )
+
+    return (label = label, res = res, hist = hist, time_s = stats.time,
+            param_train_mode = param_train_mode)
+end
+#+end_src
+
+#+RESULTS:
+
+* Execute both policies (parallel)
+
+Run Julia with at least 2 threads (for example: =julia -t 2=).
+
+#+begin_src julia-vterm
+run_specs = (
+    hard_nll_all_fixed  = (data = bac_data_all_fixed,
+                           mode = mode_all_fixed,  seed = 2101),
+    hard_nll_some_fixed = (data = bac_data_some_fixed,
+                           mode = mode_some_fixed, seed = 2102),
+)
+
+run_tasks = Dict{String, Task}()
+for (label_sym, spec) in pairs(run_specs)
+    label = String(label_sym)
+    run_tasks[label] = Threads.@spawn begin
+        println("[Thread $(Threads.threadid())] starting $label")
+        run_hardwired_nll_case(label, spec.data, spec.mode; seed = spec.seed)
+    end
+end
+
+runs = Dict{String, Any}()
+for (label, t) in run_tasks
+    runs[label] = fetch(t)
+end
+
+# Policy-aware ODE param read: trainable params live in ps.ODE_par,
+# fixed ones live in ctx2.ODE_par_fixed. Merge both for reporting so the
+# all-fixed case (empty ps.ODE_par) still prints all three values.
+function final_ode_params(r)
+    merge(r.res.ctx2.ODE_par_fixed, NamedTuple(r.res.params.ODE_par))
+end
+
+run_order = ["hard_nll_all_fixed", "hard_nll_some_fixed"]
+println("Completed ", length(runs), " runs.")
+for label in run_order
+    r = runs[label]
+    p = final_ode_params(r)
+    @printf("%-22s wall=%6.1fs  data=%.4e  ode=%.4e  β=%9.4e  δ=%9.4e  c=%9.4e\n",
+        r.label, r.time_s, r.res.metrics.data_mse, r.res.metrics.ode_mse,
+        p.β, p.δ, p.c)
+end
+#+end_src
+
+#+RESULTS:
+
+* Plots
+
+** Loss traces (NLL data loss and ODE residual)
+
+#+begin_src julia-vterm
+fig_loss = Figure(size = (1200, 420), fontsize = 11)
+ax1 = Axis(fig_loss[1, 1], title = "Data loss (NLL)", xlabel = "Global iteration", ylabel = "NLL", yscale = log10)
+ax2 = Axis(fig_loss[1, 2], title = "ODE loss", xlabel = "Global iteration", ylabel = "MSE", yscale = log10)
+
+palette = [:dodgerblue3, :darkorange2]
+for (i, label) in enumerate(run_order)
+    r = runs[label]
+    c = palette[i]
+    lines!(ax1, r.hist.iter, r.hist.data_mse; color = c, linewidth = 2, label = r.label)
+
+    valid = .!isnan.(r.hist.ode_mse)
+    lines!(ax2, r.hist.iter[valid], r.hist.ode_mse[valid]; color = c, linewidth = 2, label = r.label)
+end
+
+axislegend(ax1, position = :rb)
+axislegend(ax2, position = :rb)
+display(fig_loss)
+#+end_src
+
+** State trajectory overlays
+
+#+begin_src julia-vterm
+fig_fit = Figure(size = (1200, 800), fontsize = 11)
+state_labels = ["T(t)", "I(t)", "V(t)"]
+plot_floor = 1f-2
+
+t_eval = permutedims(Float32.(range(minimum(bac_t_obs), maximum(bac_t_obs), length = 300)))
+t_eval_vec = vec(t_eval)
+
+for (col, label) in enumerate(run_order)
+    r = runs[label]
+    Yhat_t = r.res.ctx2.predict_state(r.res.params, t_eval)
+    Yhat_raw = inverse_state(r.res.ctx2.transform, Yhat_t)
+
+    for si in 1:3
+        ax = Axis(fig_fit[si, col];
+            title  = si == 1 ? r.label : "",
+            xlabel = si == 3 ? "Days p.i." : "",
+            ylabel = state_labels[si],
+            yscale = log10,
+            xgridvisible = true, ygridvisible = true,
+            topspinevisible = false, rightspinevisible = false,
+        )
+
+        # individual mice
+        scatter!(ax,
+            bac_t_flat,
+            vec(bac_Y_flat[si, :]) .+ plot_floor;
+            color = (:black, 0.22), markersize = 3)
+
+        # mean observations
+        lines!(ax, bac_t_obs, bac_Y_mean[si, :] .+ plot_floor;
+            color = :firebrick, linewidth = 1.8)
+
+        # true ODE
+        lines!(ax, bac_t_fine, bac_sol_array[si, :] .+ plot_floor;
+            color = :grey50, linestyle = :dash, linewidth = 1.2)
+
+        # fitted
+        lines!(ax, t_eval_vec, vec(Yhat_raw[si, :]) .+ plot_floor;
+            color = :dodgerblue3, linewidth = 2.0)
+    end
+end
+
+display(fig_fit)
+#+end_src
+
+* Interpretation checklist
+
+- If *some-fixed* lowers ODE residual with similar NLL, selective freedom helps.
+- If both are close, Hardwired+NLL fit may be driven mostly by state NN capacity.
+- If all-fixed is much worse, parameter rigidity is likely limiting physics fit.
+
