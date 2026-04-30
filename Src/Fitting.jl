@@ -69,8 +69,9 @@ end
 """
 Stage 2 context: ODE-regularised training.
 
-Adds the g-predictor, dense collocation grid, ODE-specific
-epsilon, and parameter bounds on top of Stage 1 fields.
+Adds the g-predictor, dense collocation grid, ODE-specific epsilon, and
+parameter values and bounds on top of Stage 1 fields. The ODE parameters
+contained in this struct are fixed, i.e., they won't be optimized.
 """
 struct PINNCtxStage2{PS,PD,PG,T,Y,YS,GS,V,TR,TD}
     predict_state  :: PS
@@ -91,6 +92,7 @@ struct PINNCtxStage2{PS,PD,PG,T,Y,YS,GS,V,TR,TD}
     t_dense        :: TD
     t_span         :: Vector{Float32}
     ODE_par_bounds :: NamedTuple
+    ODE_par_fixed  :: NamedTuple
 end
 
 """
@@ -154,6 +156,22 @@ function extract_learned_hyper(ps)
         return HyperParams(nan, nan, nan, nan, nan)
     end
 end
+
+
+function Normalize_Data_for_ODE_dispatch(data,
+                                         ::Val{:AllFixedODEParams})
+
+    return haskey(data, :ODE_par_init) ? data : merge(data, (ODE_par_init = NamedTuple()))
+end
+
+function Normalize_Data_for_ODE_dispatch(data,
+                                         ::Val{:AllFreeODEParams})
+
+    return haskey(data, :ODE_par_init) ? data : merge(data, (ODE_par_init = NamedTuple()))
+end
+
+Normalize_Data_for_ODE_dispatch(data, ::Val{:SomeFixedODEParams}) = data
+
 
 
 #=-------------------------------------------------------------------------------
@@ -235,6 +253,7 @@ function build_contexts(
     data, hp::HyperParams;
     transform::AbstractStateTransform = IdentityTransform(),
     arch_mode::AbstractArchitectureMode = LuxMLP(),
+    param_train_mode::Symbol = :AllFreeODEParams,
 )
     # Transform raw training data into network coordinates
     Y_train_raw = raw_training_targets(data)
@@ -287,6 +306,7 @@ function build_contexts(
         data.t_dense,
         data.t_span,
         data.ODE_par_bounds,
+        data.ODE_par_fixed
     )
 
     return ctx_stage1, ctx_stage2
@@ -318,6 +338,7 @@ function rebuild_ctx_stage2(ctx::PINNCtxStage2, frozen_scale::AbstractMatrix)
         ctx.t_dense,
         ctx.t_span,
         ctx.ODE_par_bounds,
+        ctx.ODE_par_fixed
     )
 end
 
@@ -377,12 +398,13 @@ function run_stage2(
     callback_function::Function,
     default_unsupervised_loss,
     mode::AbstractHyperMode,
+    param_train_mode::Symbol
 )
     println("########## Starting Stage 2: ODE-Regularized Training ##########")
 
     # Core physics-informed loss
     loss_closure(ps, ctx) = default_unsupervised_loss(
-        ps, ctx, mode, architecture, ode_param_constructor
+        ps, ctx, mode, architecture, ode_param_constructor, param_train_mode
     )
 
     # Combine with any user-supplied auxiliary losses
@@ -427,6 +449,7 @@ function train(
     hp::HyperParams = HyperParams(1f0, 1f0, 1f0, 1f0, 1f0);
     transform::AbstractStateTransform = IdentityTransform(),
     arch_mode::AbstractArchitectureMode = LuxMLP(),
+    param_train_mode::Symbol = :AllFreeODEParams,
     user_loss_functions::AbstractVector{<:Function} = Function[],
     seed::Integer = 1,
     maxiters_stage1::Integer = 10_000,
@@ -438,8 +461,12 @@ function train(
     Opt_alg_stage2 = OptimizationOptimJL.LBFGS(m = 25),
     default_supervised_loss   = supervised_loss,
     default_unsupervised_loss = unsupervised_loss,
-)
+    )
     rng = MersenneTwister(seed)
+
+    # 0. Make sure the Data tuple has everything needed
+    data = Normalize_Data_for_ODE_dispatch(data, Val(param_train_mode))
+    @assert all(haskey(data, k) for k in (:ODE_par_init, :ODE_par_fixed)) "data is missing one or more required fields: $([k for k in (:ODE_par_init, :ODE_par_fixed) if !haskey(data, k)])"
 
     # 1. Build networks and raw parameters (arch_mode dispatches in Predictors.jl)
     State_MLP, st_StateMLP, g_MLP, st_gMLP, raw_ps =
@@ -470,12 +497,13 @@ function train(
         architecture, ode_param_constructor,
         user_loss_functions, callback_function,
         default_unsupervised_loss, mode,
+        param_train_mode
     )
 
     # 6. Final metrics
     println("########## Training Complete. Calculating Final Metrics ##########")
     d_mse, o_mse, g_s = metrics_stage2(
-        ps_trained, ctx_stage2, architecture, ode_param_constructor
+        ps_trained, ctx_stage2, architecture, ode_param_constructor, param_train_mode
     )
     metrics = (data_mse = d_mse, ode_mse = o_mse, g_std = g_s)
 
