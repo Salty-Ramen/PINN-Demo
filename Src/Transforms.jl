@@ -113,6 +113,49 @@ function inverse_state(tr::ZScoreTransform, Z::AbstractMatrix)
 end
 
 # ──────────────────────────────────────────────────────────
+# ComposedTransform: apply inner then outer
+#
+# Any two pointwise invertible transforms can be composed.
+# forward:  raw → inner → outer
+# inverse:  outer⁻¹ → inner⁻¹ → raw
+# chain rule factors multiply: dw/dy = dw/dz · dz/dy
+# ──────────────────────────────────────────────────────────
+
+"""
+Composition of two pointwise transforms: `inner` is applied first (to raw
+data), `outer` is applied second.
+
+Both transforms must be pointwise (each state row transformed independently)
+for the `transformed_rhs` chain rule to be valid.
+
+# Example: log₁₀ followed by z-scoring
+```julia
+log_tr = LogTransform(10f0, Float32[1f-2, 1f-2, 1f-2], Bool[true, true, true])
+Y_log  = forward_state(log_tr, Y_raw)
+μ, σ   = vec(mean(Y_log; dims=2)), vec(std(Y_log; dims=2))
+tr     = ComposedTransform(log_tr, ZScoreTransform(μ, σ))
+```
+"""
+struct ComposedTransform{A<:AbstractStateTransform, B<:AbstractStateTransform} <: AbstractStateTransform
+    inner::A
+    outer::B
+end
+
+function forward_state(tr::ComposedTransform, Y::AbstractMatrix)
+    forward_state(tr.outer, forward_state(tr.inner, Y))
+end
+
+function inverse_state(tr::ComposedTransform, W::AbstractMatrix)
+    inverse_state(tr.inner, inverse_state(tr.outer, W))
+end
+
+function transformed_rhs(tr::ComposedTransform, w::AbstractMatrix, g, p, raw_rhs)
+    z = inverse_state(tr.outer, w)
+    dz_dt = transformed_rhs(tr.inner, z, g, p, raw_rhs)
+    transformed_rhs(tr.outer, w, g, p, (_, _, _) -> dz_dt)
+end
+
+# ──────────────────────────────────────────────────────────
 # Vector convenience overloads
 # ──────────────────────────────────────────────────────────
 forward_state(tr::AbstractStateTransform, y::AbstractVector) =

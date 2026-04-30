@@ -1,0 +1,702 @@
+#+TITLE: Baccam — Default Loss vs Log-Likelihood Loss
+#+AUTHOR: Ramakrishna Suresh
+#+PROPERTY: header-args:julia-vterm :session *julia* :results output :exports both :dir (projectile-project-root) :tangle yes :comments both
+#+STARTUP: inlineimages overview
+
+* Background
+
+This notebook tests the hypothesis that *log-likelihood on the loss side* is
+a better-conditioned alternative to *log-transform on the state side* for
+the Baccam model.
+
+The current default setup applies a composite =LogTransform ∘ ZScoreTransform=
+to the state, then computes MSE in transformed coordinates.  The
+LogTransform's chain-rule factor =1/(y + shift)= becomes large when =y= is
+near its floor, which we conjecture amplifies near-IC noise in the ODE
+residual loss and contributes to the convergence issues seen with hardwired
+IC + log transform.
+
+The proposed alternative: leave the state in raw coordinates and compute
+the data-fit loss as the negative log-likelihood under the known
+log-normal noise model.  Up to constants:
+
+  NLL_data = (1 / 2σ²) Σ (log(y_data + ε) − log(ŷ + ε))²
+
+with σ = 0.5 (known) and ε = 1e-6 (numerical floor to handle clamped zeros
+in the noisy data).  The ODE residual loss stays as raw-coordinate MSE
+weighted by =G_stage1_std=, so the chain-rule singularity is gone.
+
+** Architectural challenge: signed magnitude
+
+In raw coordinates the network must represent T (~4e8 decreasing), I
+(~0 to ~1e8) and V (~0.07 to ~4e5).  A plain =Lux.Dense= with linear output
+fed by =tanh= hidden layers cannot easily span these magnitudes.  An =exp=
+final activation gives positive multi-magnitude output but cannot
+represent T's decline (hardwired IC needs a signed contribution).
+
+We use =sinh= as the final activation: signed, smooth, and sinh(x) for x∈[-20, 20]
+spans the full range we need.  Per-state output scaling is applied as a fixed
+post-multiplier so each state gets =sinh= in a useful range — see
+=bac_build_state_mlp_nll= below.
+
+** Comparison matrix
+
+|                                | Soft IC | Hardwired IC |
+|--------------------------------+---------+--------------|
+| Default loss + Log+ZScore      |    A    |      B       |
+| NLL loss + Identity (sinh out) |    C    |      D       |
+
+Architecture is held fixed within each row.  The architecture difference
+between rows is intrinsic to the (transform, loss) pair: log-state-transform
+makes outputs O(1) so plain linear works; raw-state forces sinh + scaling.
+This is a confounded variable but unavoidable — there is no architecture
+that works equally well in both regimes.
+
+* Setup
+
+** Boilerplate
+
+#+begin_src julia-vterm :results nil
+using Pkg;
+Pkg.activate(".")
+#+end_src
+
+#+RESULTS:
+
+#+begin_src julia-vterm :results nil
+using ComponentArrays
+using Lux, NNlib
+using Optimization, OptimizationOptimisers
+using Statistics
+using Random
+using OrdinaryDiffEq
+using CairoMakie, Makie
+using Printf
+using LinearAlgebra
+BLAS.set_num_threads(1)
+
+include(joinpath(pwd(), "Src", "Fitting.jl"))
+#+end_src
+
+#+RESULTS:
+
+** Loss-tracking callback
+
+Same as the IC-ramp comparison — accumulates loss history with a continuous
+iteration counter across Stage 1 and Stage 2 so the loss curves are plotted
+on a single x-axis.
+
+#+begin_src julia-vterm :results nil
+
+function make_loss_tracker(architecture, ode_param_ctor, maxiters_s1;
+                           log_every::Int = 100,
+                           data_loss_fn = loss_Data)
+    hist = (
+        iter     = Int[],
+        data_mse = Float32[],
+        ode_mse  = Float32[],
+        stage    = Int[],
+    )
+
+    function cb(state, l)
+        state.iter % log_every != 0 && return false
+
+        ps  = state.u
+        ctx = state.p
+
+        is_s2 = ctx isa PINNCtxStage2
+        global_iter = is_s2 ? maxiters_s1 + state.iter : state.iter
+
+        # data_loss_fn is whatever loss is being tracked — MSE or NLL
+        d_mse = data_loss_fn(ps, ctx)
+        o_mse = is_s2 ? loss_ODE(ps, ctx, architecture, ode_param_ctor) : NaN32
+
+        push!(hist.iter,     global_iter)
+        push!(hist.data_mse, d_mse)
+        push!(hist.ode_mse,  o_mse)
+        push!(hist.stage,    is_s2 ? 2 : 1)
+
+        return false
+    end
+
+    return cb, hist
+end
+#+end_src
+
+#+RESULTS:
+
+** Log-likelihood loss functions
+
+These mirror =supervised_loss= and =unsupervised_loss= from Losses.jl but
+swap =loss_Data= for =loss_Data_NLL=.  Everything else (IC penalty, ODE
+residual, L1 regularisation, bound penalty, hyper penalty) stays
+identical.
+
+The =σ_NLL= constant is the known multiplicative noise level from the data
+generator (=bac_noise_σ= below).  =NLL_FLOOR= is a numerical floor inside
+the log to handle observations that were clamped to 0.
+
+#+begin_src julia-vterm :results nil
+
+const σ_NLL    = 0.5f0     # multiplicative log-normal noise std
+const NLL_FLOOR = 1f-6     # floor inside log() for clamped zeros
+
+"""
+    loss_Data_NLL(ps, ctx) -> Float32
+
+Negative log-likelihood (up to constants) under multiplicative log-normal
+noise.  Compares predictions and observations in *raw* coordinates with a
+log applied inside the squared difference.
+
+Operates on whatever ctx.Y_train contains; ctx.predict_state output must be
+in raw coordinates for this to be meaningful, so this loss should only be
+used with IdentityTransform.
+"""
+function loss_Data_NLL(ps, ctx)
+    ŷ = ctx.predict_state(ps, ctx.t_train)
+    log_ŷ = log.(ŷ .+ NLL_FLOOR)
+    log_y = log.(ctx.Y_train .+ NLL_FLOOR)
+    return Statistics.mean(abs2, vec(log_ŷ - log_y)) / (2f0 * σ_NLL^2)
+end
+
+# Stage 1 (supervised) — replaces loss_Data with loss_Data_NLL
+function supervised_loss_NLL(ps, ctx, mode::AbstractHyperMode)
+    hp = resolve_epsilons(ps, ctx, mode)
+    penalty = hyper_penalty(ps, mode)
+
+    L = loss_Data_NLL(ps, ctx) / (hp.ϵ_Data^2 + 1f-6) +
+        l1_penalty_state(ps)   / (hp.ϵ_L1_state^2 + 1f-6) +
+        penalty
+
+    if !ctx.skip_ic_loss
+        L += loss_IC(ps, ctx) / (hp.ϵ_ic^2 + 1f-6)
+    end
+
+    return 0.5f0 * L
+end
+
+# Stage 2 (unsupervised / ODE-regularized)
+function unsupervised_loss_NLL(ps, ctx, mode::AbstractHyperMode,
+                               architecture, ode_param_constructor)
+    hp = resolve_epsilons(ps, ctx, mode)
+    penalty = hyper_penalty(ps, mode)
+
+    L = loss_Data_NLL(ps, ctx)    / (hp.ϵ_Data^2 + 1f-6) +
+        l1_penalty_state(ps)      / (hp.ϵ_L1_state^2 + 1f-6) +
+        loss_ODE(ps, ctx, architecture, ode_param_constructor) /
+            (hp.ϵ_ode^2 + 1f-6) +
+        l1_penalty_g(ps)          / (hp.ϵ_L1_g^2 + 1f-6) +
+        bound_loss(ps, ctx) +
+        penalty
+
+    if !ctx.skip_ic_loss
+        L += loss_IC(ps, ctx) / (hp.ϵ_ic^2 + 1f-6)
+    end
+
+    return 0.5f0 * L
+end
+#+end_src
+
+#+RESULTS:
+
+* Baccam model — true ODE and noisy data
+
+#+begin_src julia-vterm
+
+function Baccam_model!(du, u, p, t)
+    T, I, V = u
+    du[1] = -p.β * T * V
+    du[2] =  p.β * T * V - p.δ * I
+    du[3] =  p.p * I     - p.c * V
+end
+
+bac_true_params = (β = 2.7f-5, δ = 4.0f0, p = 1.2f-2, c = 3.0f0)
+bac_u0     = Float32[4.0f8, 0.0f0, 9.3f-2]
+bac_t_span = (0.0f0, 8.0f0)
+bac_t_fine = collect(range(bac_t_span[1], bac_t_span[2], length = 2001))
+
+bac_sol = solve(
+    ODEProblem(Baccam_model!, bac_u0, bac_t_span, bac_true_params),
+    Tsit5(); saveat = bac_t_fine
+)
+bac_sol_array = Array(bac_sol)
+
+println("Baccam ODE solved: $(size(bac_sol_array))")
+#+end_src
+
+#+RESULTS:
+
+#+begin_src julia-vterm
+
+rng_bac = MersenneTwister(42)
+bac_noise_σ = 0.5f0
+bac_n_tp    = 10
+bac_n_mice  = 12
+
+bac_idx   = round.(Int, range(1, length(bac_t_fine), length = bac_n_tp))
+bac_t_obs = Float32.(bac_t_fine[bac_idx])
+bac_Y_true = Float32.(bac_sol_array[:, bac_idx])
+
+bac_ε = randn(rng_bac, Float32, 3, bac_n_tp, bac_n_mice)
+bac_Y_noisy = clamp.(
+    bac_Y_true .* exp.(bac_noise_σ .* bac_ε .- 0.5f0 * bac_noise_σ^2),
+    0f0, Inf32
+)
+bac_Y_mean = dropdims(mean(bac_Y_noisy; dims = 3); dims = 3)
+
+println("Baccam training data: $(bac_n_tp) timepoints × $(bac_n_mice) mice")
+#+end_src
+
+#+RESULTS:
+
+* Architecture pieces
+
+** Common ODE / parameter struct
+
+#+begin_src julia-vterm :results nil
+
+struct BaccamParams{T<:AbstractFloat}
+    β::T; δ::T; c::T
+end
+BaccamParams(nt) = BaccamParams(nt.β, nt.δ, nt.c)
+
+function BaccamArchitectureRaw(y, g, p::BaccamParams)
+    T, I, V = y[1,:], y[2,:], y[3,:]
+    g_T, g_V = g[1,:], g[2,:]
+    dT = g_T
+    dI = p.β .* T .* V .- p.δ .* I
+    dV = g_V .- p.c .* V
+    return permutedims(hcat(dT, dI, dV))
+end
+
+# g network is the same regardless of which row of the matrix we're in —
+# its output is in raw coordinates either way and the magnitudes are
+# moderate.
+bac_build_g_mlp() = Lux.Chain(
+    Lux.Dense(1, 6, tanh_fast),
+    Lux.Dense(6, 4, tanh_fast),
+    Lux.Dense(4, 2),
+)
+#+end_src
+
+#+RESULTS:
+
+** State MLP — default (linear output, used with log+zscore transform)
+
+#+begin_src julia-vterm :results nil
+
+bac_build_state_mlp_default() = Lux.Chain(
+    Lux.Dense(1, 8, tanh_fast),
+    Lux.Dense(8, 6, tanh_fast),
+    Lux.Dense(6, 3),
+)
+#+end_src
+
+#+RESULTS:
+
+** State MLP — NLL (sinh output, per-state scale, used with identity transform)
+
+The =sinh= activation gives signed multi-magnitude output (sinh(20) ≈ 2.4e8).
+Per-state output scaling lets each state get sinh in a useful range without
+the network having to learn extreme weight magnitudes.  Scales are
+=Y_TRUE_SCALE= which corresponds to roughly the peak magnitude of each
+true state — chosen from the analytic Baccam solution, not learned.
+
+The trailing =Lux.WrappedFunction= multiplies the sinh output element-wise
+by the scale vector.  Since this is a fixed (non-trainable) operation it
+adds no parameters; it just re-scales the output to be in a learnable range.
+
+#+begin_src julia-vterm :results nil
+
+# Per-state magnitude scale — set from the true peak of each state.
+# In a real application you'd derive this from the data:
+# something like `vec(maximum(abs.(Y_train); dims=2))`.
+const BAC_Y_SCALE = Float32[4f8, 1f8, 5f5]   # T peak, I peak, V peak
+
+# The wrapper applies sinh and scales row-wise.  Defined as a plain function
+# so it's StatefulLuxLayer-compatible.
+function sinh_scale(x::AbstractMatrix)
+    return BAC_Y_SCALE .* sinh.(x)
+end
+
+bac_build_state_mlp_nll() = Lux.Chain(
+    Lux.Dense(1, 8, tanh_fast),
+    Lux.Dense(8, 6, tanh_fast),
+    Lux.Dense(6, 3),                      # raw signed output
+    Lux.WrappedFunction(sinh_scale),      # final per-state scaling
+)
+#+end_src
+
+#+RESULTS:
+
+* Transforms and data packing
+
+** Default row — Log + ZScore composite
+
+The default loss path uses the existing transform stack: log on the
+states (so peak magnitudes become ~9, ~8, ~5.5), then z-score on the
+log-coordinates so each row is roughly N(0,1).
+
+#+begin_src julia-vterm :results nil
+
+# Log on the raw states first
+bac_log_tr = LogTransform(
+    10f0,
+    Float32[1f-6, 1f-6, 1f-6],
+    Bool[true, true, true],
+)
+
+# Compute per-row mean and std of the LOG-transformed mean data so the
+# z-score brings the network outputs to ~N(0,1)
+bac_Y_log = forward_state(bac_log_tr, bac_Y_mean)
+bac_zscore_μ = vec(mean(bac_Y_log; dims = 2))
+bac_zscore_σ = vec(std(bac_Y_log; dims = 2))
+bac_zscore_tr = ZScoreTransform(bac_zscore_μ, bac_zscore_σ)
+
+# Composite transform: state → log → zscore
+bac_transform_default = ComposedTransform(bac_log_tr, bac_zscore_tr)
+#+end_src
+
+#+RESULTS:
+
+** NLL row — Identity transform
+
+The NLL loss compares =log(ŷ)= and =log(y_data)= directly, both in raw
+coordinates.  No state-space transform.
+
+#+begin_src julia-vterm :results nil
+
+bac_transform_nll = IdentityTransform()
+#+end_src
+
+#+RESULTS:
+
+** Shared data tuple skeleton
+
+The same data tuple works for both rows of the matrix; the transform is
+passed separately as a kwarg to =train()=.
+
+#+begin_src julia-vterm :results nil
+
+bac_t_train = permutedims(bac_t_obs)
+bac_t_dense = permutedims(Float32.(range(
+    minimum(bac_t_obs), maximum(bac_t_obs); length = 1000)))
+bac_t_span_vec = Float32[minimum(bac_t_obs), maximum(bac_t_obs)]
+
+bac_data = (
+    t_train        = bac_t_train,
+    Y_train        = bac_Y_mean,                    # raw observations
+    Y_train_std    = ones(Float32, 3, 1),
+    t_dense        = bac_t_dense,
+    t_span         = bac_t_span_vec,
+    y0_init        = bac_u0,
+    ODE_par_init   = (β = 1.0f-4, δ = 1.0f0, c = 1.0f0),
+    ODE_par_bounds = (β = Float32[0, 1f-2],
+                      δ = Float32[0, 20],
+                      c = Float32[0, 20]),
+)
+#+end_src
+
+#+RESULTS:
+
+* Hyperparameters and iteration budget
+
+#+begin_src julia-vterm :results nil
+
+# Stage 1 / Stage 2 budgets — modest for a first comparison
+bac_maxiters_s1 = 30_000
+bac_maxiters_s2 = 80_000
+bac_lr = 1f-4
+
+#                                ϵ_ic    ϵ_ode   ϵ_Data   ϵ_L1_s   ϵ_L1_g
+bac_hp_default_soft = HyperParams(0.1f0,  0.1f0,  4f-4,    0.5f0,   0.5f0)
+bac_hp_default_hard = HyperParams(0f0,    0.1f0,  4f-4,    0.5f0,   0.5f0)
+bac_hp_nll_soft     = HyperParams(0.1f0,  0.1f0,  4f-4,    0.5f0,   0.5f0)
+bac_hp_nll_hard     = HyperParams(0f0,    0.1f0,  4f-4,    0.5f0,   0.5f0)
+#+end_src
+
+#+RESULTS:
+
+* Mode configurations
+
+Each cell of the 2×2 matrix is a NamedTuple with everything =train()=
+needs for that combination.  The four cells are stored under the keys:
+
+  - ="default_soft"=    Default loss + Log+ZScore + Soft IC
+  - ="default_hard"=    Default loss + Log+ZScore + Hardwired IC
+  - ="nll_soft"=        NLL loss + Identity + Soft IC + sinh-output MLP
+  - ="nll_hard"=        NLL loss + Identity + Hardwired IC + sinh-output MLP
+
+#+begin_src julia-vterm :results nil
+
+bac_mode_configs = Dict(
+    "default_soft" => (
+        arch_mode       = LuxMLP(),
+        hp              = bac_hp_default_soft,
+        transform       = bac_transform_default,
+        sup_loss        = supervised_loss,
+        unsup_loss      = unsupervised_loss,
+        build_state_mlp = bac_build_state_mlp_default,
+        track_data_loss = loss_Data,
+    ),
+    "default_hard" => (
+        arch_mode       = LuxMLPHardwiredIC(),
+        hp              = bac_hp_default_hard,
+        transform       = bac_transform_default,
+        sup_loss        = supervised_loss,
+        unsup_loss      = unsupervised_loss,
+        build_state_mlp = bac_build_state_mlp_default,
+        track_data_loss = loss_Data,
+    ),
+    "nll_soft" => (
+        arch_mode       = LuxMLP(),
+        hp              = bac_hp_nll_soft,
+        transform       = bac_transform_nll,
+        sup_loss        = supervised_loss_NLL,
+        unsup_loss      = unsupervised_loss_NLL,
+        build_state_mlp = bac_build_state_mlp_nll,
+        track_data_loss = loss_Data_NLL,
+    ),
+    "nll_hard" => (
+        arch_mode       = LuxMLPHardwiredIC(),
+        hp              = bac_hp_nll_hard,
+        transform       = bac_transform_nll,
+        sup_loss        = supervised_loss_NLL,
+        unsup_loss      = unsupervised_loss_NLL,
+        build_state_mlp = bac_build_state_mlp_nll,
+        track_data_loss = loss_Data_NLL,
+    ),
+)
+#+end_src
+
+#+RESULTS:
+
+* Training (parallel)
+
+Run each cell on its own thread.  Start Julia with at least 4 threads
+(=julia -t 4= or =JULIA_NUM_THREADS=4=).  BLAS threads are pinned to 1 per
+task so optimisers don't contend.
+
+#+begin_src julia-vterm
+
+using Base.Threads
+
+bac_tasks = Dict{String, Task}()
+bac_loss_histories = Dict{String, Any}()
+
+for (label, cfg) in bac_mode_configs
+    cb, hist = make_loss_tracker(
+        BaccamArchitectureRaw, BaccamParams, bac_maxiters_s1;
+        data_loss_fn = cfg.track_data_loss,
+    )
+    bac_loss_histories[label] = hist
+
+    bac_tasks[label] = Threads.@spawn begin
+        println("[Thread $(Threads.threadid())] Baccam — Starting $label")
+
+        stats = @timed res = train(
+            FixedHyper(),
+            bac_data,
+            BaccamArchitectureRaw,
+            BaccamParams,
+            cfg.hp;
+            transform                  = cfg.transform,
+            arch_mode                  = cfg.arch_mode,
+            seed                       = 1,
+            maxiters_stage1            = bac_maxiters_s1,
+            maxiters_stage2            = bac_maxiters_s2,
+            Opt_alg_stage1             = OptimizationOptimisers.Adam(bac_lr),
+            Opt_alg_stage2             = OptimizationOptimisers.Adam(bac_lr),
+            build_state_mlp            = cfg.build_state_mlp,
+            build_g_mlp                = bac_build_g_mlp,
+            callback_function          = cb,
+            default_supervised_loss    = cfg.sup_loss,
+            default_unsupervised_loss  = cfg.unsup_loss,
+        )
+
+        (res = res, time_s = stats.time, cfg = cfg)
+    end
+end
+
+bac_results = Dict{String, Any}()
+for (label, t) in bac_tasks
+    bac_results[label] = fetch(t)
+    r = bac_results[label]
+    @printf("\n  [Baccam %s] Wall: %.1fs  Data: %.4e  ODE: %.4e\n",
+            label, r.time_s, r.res.metrics.data_mse, r.res.metrics.ode_mse)
+    @printf("  [Baccam %s] β = %.2e (true 2.7e-5)  δ = %.3f (true 4.0)  c = %.3f (true 3.0)\n",
+            label, r.res.params.ODE_par.β, r.res.params.ODE_par.δ, r.res.params.ODE_par.c)
+end
+#+end_src
+
+#+RESULTS:
+
+* Diagnostics
+
+** Mode order and styling
+
+#+begin_src julia-vterm :results nil
+
+mode_order = ["default_soft", "default_hard", "nll_soft", "nll_hard"]
+mode_labels = ["Default + Soft", "Default + Hardwired",
+               "NLL + Soft",     "NLL + Hardwired"]
+mode_colors = Dict(
+    "default_soft" => :royalblue,
+    "default_hard" => :darkorange,
+    "nll_soft"     => :forestgreen,
+    "nll_hard"     => :firebrick,
+)
+#+end_src
+
+#+RESULTS:
+
+** Trajectory fits
+
+State trajectories per cell.  Each column is a mode, each row a state.
+Predictions live in different transformed coordinates per row of the
+matrix, but =inverse_state= on each cell's transform brings them back to
+raw coordinates so they can be compared against the true ODE.
+
+#+begin_src julia-vterm
+
+fig = Figure(size = (1400, 700), fontsize = 11)
+state_labels = ["T(t)", "I(t)", "V(t)"]
+plot_floor = 1f-2
+
+t_eval = permutedims(Float32.(range(bac_t_span[1], bac_t_span[2]; length = 300)))
+
+for (col, mode_key) in enumerate(mode_order)
+    r   = bac_results[mode_key]
+    cfg = r.cfg
+    ps  = r.res.params
+    ctx = r.res.ctx2
+
+    ŷ_in_loss_coords = ctx.predict_state(ps, t_eval)
+    ŷ_raw            = inverse_state(cfg.transform, ŷ_in_loss_coords)
+
+    for si in 1:3
+        ax = Makie.Axis(fig[si, col];
+            title  = si == 1 ? mode_labels[col] : "",
+            xlabel = si == 3 ? "Days p.i." : "",
+            ylabel = col == 1 ? state_labels[si] : "",
+            yscale = Makie.log10,
+            xgridvisible = true, ygridvisible = true,
+            topspinevisible = false, rightspinevisible = false,
+            xticklabelsize = 8, yticklabelsize = 8,
+            titlesize = 11,
+        )
+
+        lines!(ax, bac_t_fine, bac_sol_array[si, :] .+ plot_floor;
+            color = :grey60, linewidth = 1.5, linestyle = :dash)
+        lines!(ax, vec(t_eval), ŷ_raw[si, :] .+ plot_floor;
+            color = mode_colors[mode_key], linewidth = 2)
+        scatter!(ax, bac_t_obs, bac_Y_mean[si, :] .+ plot_floor;
+            color = :black, markersize = 5)
+    end
+end
+
+Legend(fig[4, 1:4],
+    [LineElement(color = :grey60, linewidth = 1.5, linestyle = :dash),
+     MarkerElement(marker = :circle, markersize = 7, color = :black)],
+    ["True ODE", "Training mean"],
+    orientation = :horizontal, tellwidth = false)
+
+display(fig)
+#+end_src
+
+#+RESULTS:
+
+** Loss dynamics
+
+Both loss curves (data + ODE) on a log-y axis.  Note that "Data" means
+different things across rows of the matrix: MSE-in-transformed-coords
+for the default rows, NLL for the NLL rows.  Magnitudes aren't directly
+comparable across rows; only within-row trends are meaningful.
+
+#+begin_src julia-vterm
+
+fig_loss = Figure(size = (1200, 500), fontsize = 11)
+
+# Data loss
+ax_d = Makie.Axis(fig_loss[1, 1];
+    title  = "Data loss (MSE for default rows, NLL for NLL rows)",
+    xlabel = "",
+    ylabel = "Data loss",
+    yscale = Makie.log10,
+    xgridvisible = true, ygridvisible = true,
+    topspinevisible = false, rightspinevisible = false,
+    xticklabelsize = 8, yticklabelsize = 8)
+
+vlines!(ax_d, [bac_maxiters_s1]; color = :grey50, linestyle = :dash, linewidth = 1)
+
+for label in mode_order
+    hist = bac_loss_histories[label]
+    isempty(hist.iter) && continue
+    lines!(ax_d, hist.iter, hist.data_mse;
+        color = mode_colors[label], linewidth = 1.2, label = label)
+end
+
+axislegend(ax_d; position = :rt, labelsize = 8)
+
+# ODE residual
+ax_o = Makie.Axis(fig_loss[2, 1];
+    title  = "ODE residual MSE",
+    xlabel = "Iteration (global)",
+    ylabel = "ODE MSE",
+    yscale = Makie.log10,
+    xgridvisible = true, ygridvisible = true,
+    topspinevisible = false, rightspinevisible = false,
+    xticklabelsize = 8, yticklabelsize = 8)
+
+vlines!(ax_o, [bac_maxiters_s1]; color = :grey50, linestyle = :dash, linewidth = 1)
+
+for label in mode_order
+    hist = bac_loss_histories[label]
+    isempty(hist.iter) && continue
+    omask = .!isnan.(hist.ode_mse)
+    any(omask) || continue
+    lines!(ax_o, hist.iter[omask], hist.ode_mse[omask];
+        color = mode_colors[label], linewidth = 1.2)
+end
+
+Makie.linkxaxes!(ax_d, ax_o)
+
+Label(fig_loss[0, 1],
+    "Training loss dynamics — Stage 1 | Stage 2 (dashed line = transition)";
+    fontsize = 13, tellwidth = false)
+
+display(fig_loss)
+#+end_src
+
+#+RESULTS:
+
+* Summary
+
+#+begin_src julia-vterm
+
+println("\n", "="^85)
+println("  Baccam — Default Loss vs Log-Likelihood Loss")
+println("  True parameters: β=2.7e-5, δ=4.0, c=3.0")
+println("="^85)
+@printf("  %-22s  %-12s  %-12s  %-10s  %-10s  %-10s  %-8s\n",
+        "Mode", "Data",  "ODE",  "β_rec",   "δ_rec",   "c_rec",   "Wall(s)")
+println("  ", "-"^81)
+
+for label in mode_order
+    r = bac_results[label]
+    @printf("  %-22s  %.4e  %.4e  %.2e    %-10.3f  %-10.3f  %8.1f\n",
+            label,
+            r.res.metrics.data_mse, r.res.metrics.ode_mse,
+            r.res.params.ODE_par.β, r.res.params.ODE_par.δ, r.res.params.ODE_par.c,
+            r.time_s)
+end
+
+println("\nWhat to look for:")
+println("  • If NLL rows show smaller ODE residual than default rows,")
+println("    the chain-rule singularity in the log transform was hurting convergence.")
+println("  • If hardwired IC works for NLL but not for default,")
+println("    confirms the hardwired+log interaction was the issue, not hardwired IC itself.")
+println("  • β recovery is the most discriminating parameter — the others are easier.")
+#+end_src
+
+#+RESULTS:

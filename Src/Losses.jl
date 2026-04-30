@@ -11,7 +11,7 @@ three predictor closures stored on the context struct:
     ctx.predict_g(ps, t_grid)      →  (n_g × B)
 
 The file is organised top-down:
-  1. Scalar utilities (MSE, distance penalties)
+  1. Utilities (MSE, distance penalties, ODE Param Dispatch)
   2. Individual loss terms
   3. Hyperparameter resolution (fixed vs adaptive)
   4. Composite loss assembly (supervised / unsupervised)
@@ -19,7 +19,7 @@ The file is organised top-down:
 
 #=-------------------------------------------------------------------------------
 
-Scalar Utilities
+Utilities
 
 -------------------------------------------------------------------------------=#
 
@@ -61,9 +61,9 @@ l1_mean(x) = sum(abs, x) / length(x)
 
 Compute final scalar diagnostics using the trained parameters.
 """
-function metrics_stage2(ps, ctx, architecture::Function, ode_param_constructor)
+function metrics_stage2(ps, ctx, architecture::Function, ode_param_constructor, param_train_mode)
     data_mse = loss_Data(ps, ctx)
-    ode_mse  = loss_ODE(ps, ctx, architecture, ode_param_constructor)
+    ode_mse  = loss_ODE(ps, ctx, architecture, ode_param_constructor, param_train_mode)
 
     # Standard deviation of g-network output as a health check:
     # near-zero std suggests the g-network collapsed to a constant
@@ -72,6 +72,50 @@ function metrics_stage2(ps, ctx, architecture::Function, ode_param_constructor)
 
     return (data_mse = data_mse, ode_mse = ode_mse, g_std = g_std)
 end
+
+
+# We have three cases to think about- Fully fixed, partially fixed and fully
+# free ODE param optimization. We can use Julia's dispatch for this.
+
+function resolve_ode_params(
+    ::Val{:AllFixedODEParams},
+    ps,
+    ctx::PINNCtxStage2,
+    ode_param_constructor)
+    
+    return ode_param_constructor(ctx.ODE_par_fixed)
+end
+
+
+function resolve_ode_params(
+    ::Val{:AllFreeODEParams},
+    ps,
+    ctx::PINNCtxStage2,
+    ode_param_constructor)
+
+    return ode_param_constructor(ps.ODE_par)
+end
+
+function resolve_ode_params(
+    ::Val{:SomeFixedODEParams},
+    ps,
+    ctx::PINNCtxStage2,
+    ode_param_constructor)
+
+    # overlap = intersect(
+    #     keys(ctx.ODE_par_fixed),
+    #     keys(ps.ODE_par))
+
+    # if !isempty(overlap)
+    #     @warn "Overlapping keys $overlap — These will be fit"
+    # end
+ 
+    merged_param_tuple = merge(ctx.ODE_par_fixed, ps.ODE_par)
+
+    return ode_param_constructor(merged_param_tuple)
+end
+
+
 
 #=-------------------------------------------------------------------------------
 
@@ -110,7 +154,7 @@ end
 
 
 """
-   loss_ODE(ps, ctx, architecture, ode_param_constructor)
+   loss_ODE(ps, ctx, architecture, ode_param_constructor, param_train_mode)
 
 Physics-residual loss: MSE between the state network's time derivative
 (from `predict_deriv`) and the architecture RHS evaluated with
@@ -120,9 +164,13 @@ the current state and g predictions.
 coordinates; `transformed_rhs` handles the chain-rule bridge to the
 network's coordinate space
 """
-function loss_ODE(ps, ctx, architecture::Function, ode_param_constructor)
+function loss_ODE(ps, ctx, architecture::Function, ode_param_constructor, param_train_mode::Symbol)
     t_dense = ctx.t_dense
-    ode_par = ode_param_constructor(ps.ODE_par)
+
+    ode_par = resolve_ode_params(Val(param_train_mode),
+                                 ps,
+                                 ctx,
+                                 ode_param_constructor)
 
     # All three predictions via contract closures
     ẑ     = ctx.predict_state(ps, t_dense)
@@ -290,7 +338,8 @@ networks + parameter bound penalty.
 IC term is omitted when `ctx.skip_ic_loss == true`.
 """
 function unsupervised_loss(ps, ctx, mode::AbstractHyperMode,
-                           architecture, ode_param_constructor)
+                           architecture, ode_param_constructor,
+                           param_train_mode::Symbol)
     hp = resolve_epsilons(ps, ctx, mode)
     penalty = hyper_penalty(ps, mode)
 
@@ -298,8 +347,10 @@ function unsupervised_loss(ps, ctx, mode::AbstractHyperMode,
         l1_penalty_state(ps)  / (hp.ϵ_L1_state^2 + 1f-6) +
         loss_ODE(ps, ctx,
                  architecture,
-                 ode_param_constructor) / (hp.ϵ_ode^2 + 1f-6) +
+                 ode_param_constructor,
+                  param_train_mode) / (hp.ϵ_ode^2 + 1f-6) +
         l1_penalty_g(ps)      / (hp.ϵ_L1_g^2 + 1f-6) +
+        bound_loss(ps, ctx) +
         penalty
 
     if !ctx.skip_ic_loss
