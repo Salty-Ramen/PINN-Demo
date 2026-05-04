@@ -19,6 +19,7 @@ Utilities
 -------------------------------------------------------------------------------=#
 
 using Optimization, OptimizationOptimisers, OptimizationOptimJL
+import Optim
 
 
 """
@@ -222,6 +223,40 @@ function build_trainables(::AdaptiveHyper, ps_state, ps_g, ode_par_init, hp::Hyp
     )
 end
 
+"""
+    build_box_bounds(ps, ode_bounds) -> (lb, ub)
+
+Construct lower/upper bound ComponentArrays matching the structure of `ps`.
+NN weights and hyper params are unconstrained (±Inf); ODE parameters get
+finite bounds from `ode_bounds`.  Keys missing from `ode_bounds` default
+to (0, +Inf).
+"""
+function build_box_bounds(ps::ComponentArray, ode_bounds::NamedTuple)
+    lb = copy(ps); lb .= -Inf32
+    ub = copy(ps); ub .= +Inf32
+
+    hasproperty(ps, :ODE_par) || return lb, ub
+
+    ci         = getaxes(ps)[1][:ODE_par]
+    ode_offset = first(ci.idx) - 1
+    ode_ax     = ci.ax
+    lb_data    = ComponentArrays.getdata(lb)
+    ub_data    = ComponentArrays.getdata(ub)
+
+    for k in keys(ode_ax)
+        lo, hi = if k in propertynames(ode_bounds)
+            let b = getproperty(ode_bounds, k); (b[1], b[2]) end
+        else
+            (0f0, Inf32)
+        end
+        flat_idx = ode_offset + ode_ax[k].idx
+        lb_data[flat_idx] = lo
+        ub_data[flat_idx] = hi
+    end
+
+    return lb, ub
+end
+
 #=-------------------------------------------------------------------------------
 
 Context construction
@@ -379,13 +414,18 @@ function run_stage1(
     return res.u
 end
 
+_maybe_wrap_fminbox(opt, ::Val{false}) = opt
+_maybe_wrap_fminbox(opt, ::Val{true})                          = opt
+_maybe_wrap_fminbox(opt::Optim.AbstractOptimizer, ::Val{true}) = Optim.Fminbox(opt)
+
 """
     run_stage2(stage1_params, ctx, opt, maxiters, architecture,
                ode_param_constructor, user_losses, callback,
-               unsupervised_loss_fn, mode)
+               unsupervised_loss_fn, mode; lb, ub)
 
 Run Stage 2 (ODE-regularised) optimisation and return the
-trained parameter vector.
+trained parameter vector.  When `lb`/`ub` are provided the
+optimizer enforces box constraints natively.
 """
 function run_stage2(
     stage1_params,
@@ -398,7 +438,9 @@ function run_stage2(
     callback_function::Function,
     default_unsupervised_loss,
     mode::AbstractHyperMode,
-    param_train_mode::Symbol
+    param_train_mode::Symbol;
+    lb = nothing,
+    ub = nothing,
 )
     println("########## Starting Stage 2: ODE-Regularized Training ##########")
 
@@ -416,10 +458,14 @@ function run_stage2(
     end
 
     optfun = make_optfun(loss_combined)
-    prob   = Optimization.OptimizationProblem(optfun, stage1_params, ctx_stage2)
+    prob   = Optimization.OptimizationProblem(optfun, stage1_params, ctx_stage2;
+                                              lb = lb, ub = ub)
+
+    has_bounds = lb !== nothing && ub !== nothing
+    opt_effective = _maybe_wrap_fminbox(Opt_alg_stage2, Val(has_bounds))
 
     res = Optimization.solve(
-        prob, Opt_alg_stage2;
+        prob, opt_effective;
         maxiters = maxiters_stage2,
         callback = callback_function,
     )
@@ -491,13 +537,15 @@ function train(
     frozen_scale = compute_frozen_ode_scale(ps_post_stage1, ctx_stage2)
     ctx_stage2 = rebuild_ctx_stage2(ctx_stage2, frozen_scale)
 
-    # 5. Stage 2: ODE-regularised training
+    # 5. Build box bounds and run Stage 2: ODE-regularised training
+    lb, ub = build_box_bounds(ps_post_stage1, data.ODE_par_bounds)
     ps_trained = run_stage2(
         ps_post_stage1, ctx_stage2, Opt_alg_stage2, maxiters_stage2,
         architecture, ode_param_constructor,
         user_loss_functions, callback_function,
         default_unsupervised_loss, mode,
-        param_train_mode
+        param_train_mode;
+        lb = lb, ub = ub,
     )
 
     # 6. Final metrics

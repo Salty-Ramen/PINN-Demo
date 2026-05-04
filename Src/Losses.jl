@@ -350,7 +350,6 @@ function unsupervised_loss(ps, ctx, mode::AbstractHyperMode,
                  ode_param_constructor,
                   param_train_mode) / (hp.ϵ_ode^2 + 1f-6) +
         l1_penalty_g(ps)      / (hp.ϵ_L1_g^2 + 1f-6) +
-        bound_loss(ps, ctx) +
         penalty
 
     if !ctx.skip_ic_loss
