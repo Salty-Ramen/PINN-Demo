@@ -162,16 +162,16 @@ end
 function Normalize_Data_for_ODE_dispatch(data,
                                          ::Val{:AllFixedODEParams})
 
-    return haskey(data, :ODE_par_init) ? data : merge(data, (ODE_par_init = NamedTuple()))
+    return haskey(data, :ODE_par_init) ? data : merge(data, (ODE_par_init = NamedTuple(),))
 end
 
 function Normalize_Data_for_ODE_dispatch(data,
                                          ::Val{:AllFreeODEParams})
 
-    return haskey(data, :ODE_par_fixed) ? data : merge(data, (ODE_par_fixed = NamedTuple()))
+    return haskey(data, :ODE_par_fixed) ? data : merge(data, (ODE_par_fixed = NamedTuple(),))
 end
 
-Normalize_Data_for_ODE_dispatch(data, ::Val{:SomeFixedODEParams}) = datac
+Normalize_Data_for_ODE_dispatch(data, ::Val{:SomeFixedODEParams}) = data
 
 
 
@@ -458,19 +458,45 @@ function run_stage2(
     end
 
     optfun = make_optfun(loss_combined)
-    prob   = Optimization.OptimizationProblem(optfun, stage1_params, ctx_stage2;
-                                              lb = lb, ub = ub)
 
-    has_bounds = lb !== nothing && ub !== nothing
+    # Compute opt_effective first so we know whether bounds will actually be used.
+    # Unconstrained backends (Optimisers.Adam, OptimizationOptimJL.LBFGS) error
+    # when lb/ub are present in OptimizationProblem; only pass them when
+    # _maybe_wrap_fminbox actually wrapped the optimizer (i.e. Fminbox is active).
+    has_bounds    = lb !== nothing && ub !== nothing
     opt_effective = _maybe_wrap_fminbox(Opt_alg_stage2, Val(has_bounds))
+    use_bounds    = has_bounds && opt_effective !== Opt_alg_stage2
 
-    res = Optimization.solve(
-        prob, opt_effective;
-        maxiters = maxiters_stage2,
-        callback = callback_function,
-    )
+    prob = Optimization.OptimizationProblem(optfun, stage1_params, ctx_stage2;
+                                            lb = use_bounds ? lb : nothing,
+                                            ub = use_bounds ? ub : nothing)
 
-    return res.u
+    # Track last finite-loss iterate so we can recover if the optimizer
+    # throws (e.g. LBFGS line search hitting NaN gradients).
+    best_ps = Ref(copy(stage1_params))
+    best_loss = Ref(Inf32)
+    function safe_callback(state, l)
+        if isfinite(l) && l < best_loss[]
+            best_ps[] = copy(state.u)
+            best_loss[] = l
+        end
+        return callback_function(state, l)
+    end
+
+    local trained
+    try
+        res = Optimization.solve(
+            prob, opt_effective;
+            maxiters = maxiters_stage2,
+            callback = safe_callback,
+        )
+        trained = res.u
+    catch e
+        @warn "Stage-2 optimizer threw; returning best iterate (loss=$(best_loss[]))" exception = (e,)
+        trained = best_ps[]
+    end
+
+    return trained
 end
 
 #=-------------------------------------------------------------------------------
@@ -507,6 +533,8 @@ function train(
     Opt_alg_stage2 = OptimizationOptimJL.LBFGS(m = 25),
     default_supervised_loss   = supervised_loss,
     default_unsupervised_loss = unsupervised_loss,
+    use_bounds::Bool = true,
+    soft_bound_fallback::Bool = false,
     )
     rng = MersenneTwister(seed)
 
@@ -538,11 +566,18 @@ function train(
     ctx_stage2 = rebuild_ctx_stage2(ctx_stage2, frozen_scale)
 
     # 5. Build box bounds and run Stage 2: ODE-regularised training
-    lb, ub = build_box_bounds(ps_post_stage1, data.ODE_par_bounds)
+    lb, ub = use_bounds ? build_box_bounds(ps_post_stage1, data.ODE_par_bounds) : (nothing, nothing)
+
+    effective_user_losses = if soft_bound_fallback && !use_bounds
+        vcat([bound_loss], user_loss_functions)
+    else
+        user_loss_functions
+    end
+
     ps_trained = run_stage2(
         ps_post_stage1, ctx_stage2, Opt_alg_stage2, maxiters_stage2,
         architecture, ode_param_constructor,
-        user_loss_functions, callback_function,
+        effective_user_losses, callback_function,
         default_unsupervised_loss, mode,
         param_train_mode;
         lb = lb, ub = ub,
