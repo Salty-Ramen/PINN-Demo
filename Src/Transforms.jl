@@ -91,13 +91,17 @@ end
 Map log-transformed trajectories `Z` back into raw biological coordinates.
 """
 function inverse_state(tr::LogTransform, Z::AbstractMatrix)
+    # Clamp exponents to avoid Float32 overflow in 10^z (max ≈ 3.4e38).
+    # ±20 covers biological ranges 1e-20 … 1e20 with wide margin.
+    max_exp = Float32(20)
     rows = map(axes(Z, 1)) do i
         row = Z[i:i, :]
         if tr.mask[i]
+            clamped = clamp.(row, -max_exp, max_exp)
             if tr.base == ℯ
-                exp.(row) .- tr.shift[i]
+                exp.(clamped) .- tr.shift[i]
             else
-                tr.base .^ row .- tr.shift[i]
+                tr.base .^ clamped .- tr.shift[i]
             end
         else
             row

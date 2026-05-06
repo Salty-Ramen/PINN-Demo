@@ -180,7 +180,12 @@ function loss_ODE(ps, ctx, architecture::Function, ode_param_constructor, param_
     # RHS in the transformed coordinate space
     f_ẑ = transformed_rhs(ctx.transform, ẑ, g_arr, ode_par, architecture)
 
-    return MSE(dẑdt, f_ẑ, ctx.G_stage1_std)
+    # Adaptive scale: when the architecture RHS is large, normalize by its
+    # own magnitude to keep the residual as a relative error and prevent
+    # Float32 overflow in the squared term.
+    ode_scale = max.(abs.(f_ẑ), ctx.G_stage1_std)
+
+    return MSE(dẑdt, f_ẑ, ode_scale)
 end
 
 
@@ -350,7 +355,6 @@ function unsupervised_loss(ps, ctx, mode::AbstractHyperMode,
                  ode_param_constructor,
                   param_train_mode) / (hp.ϵ_ode^2 + 1f-6) +
         l1_penalty_g(ps)      / (hp.ϵ_L1_g^2 + 1f-6) +
-        bound_loss(ps, ctx) +
         penalty
 
     if !ctx.skip_ic_loss
