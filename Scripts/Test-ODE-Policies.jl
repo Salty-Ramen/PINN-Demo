@@ -110,8 +110,19 @@ println("\n==== _maybe_wrap_fminbox ====\n")
 
 import Optim
 
-check("LBFGS wrapped with Fminbox when bounds active") do
+# OptimizationOptimJL re-exports Optim types, so OptimizationOptimJL.LBFGS === Optim.LBFGS.
+# Both are Optim.AbstractOptimizer and will be wrapped by _maybe_wrap_fminbox.
+# Use train(; use_bounds=false) to run Optim-backed optimizers unconstrained.
+
+check("OptimizationOptimJL.LBFGS wrapped (it IS Optim.AbstractOptimizer)") do
     opt = OptimizationOptimJL.LBFGS(m = 25)
+    @assert opt isa Optim.AbstractOptimizer "re-export means same type"
+    wrapped = _maybe_wrap_fminbox(opt, Val(true))
+    @assert wrapped isa Optim.Fminbox
+end
+
+check("Raw Optim.LBFGS wrapped with Fminbox when bounds active") do
+    opt = Optim.LBFGS()
     wrapped = _maybe_wrap_fminbox(opt, Val(true))
     @assert wrapped isa Optim.Fminbox
 end
